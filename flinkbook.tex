@@ -1,4 +1,8 @@
 \documentclass[cn,11pt,chinese]{elegantbook}
+\usepackage{tikz}
+\usepackage{epigraph}
+
+
 
 \title{Flink实战宝典}
 \subtitle{Flink理论与实战}
@@ -15,58 +19,139 @@
 \usepackage{array}
 \newcommand{\ccr}[1]{\makecell{{\color{#1}\rule{1cm}{1cm}}}}
 
+\tikzset{
+box/.style ={
+rectangle, %矩形节点
+rounded corners =5pt, %圆角
+minimum width =50pt, %最小宽度
+minimum height =20pt, %最小高度
+inner sep=5pt, %文字和边框的距离
+draw=blue %边框颜色
+}
+}
 \begin{document}
+
+\begin{tikzpicture}
+  \draw (0,0) -- (4,0);
+\end{tikzpicture}
 
 \maketitle
 \frontmatter
 
 \tableofcontents
 
+\mainmatter
 \part{Flink的使用}
 
-\chapter{第一章，流式处理理论概述}
+\chapter{流式处理理论概述}
 
-\chapter{第二章，Flink框架快速上手}
+\chapter{Flink框架快速上手}
 
-\chapter{第三章，Flink DataStream API}
+\chapter{Flink DataStream API}
 
-\chapter{第四章，基于时间和窗口的算子}
+\chapter{基于时间和窗口的算子}
 
-\chapter{第五章，Flink状态编程}
+\chapter{Flink状态编程}
 
-\chapter{第六章，Flink DataSet API}
+\chapter{Flink DataSet API}
 
-\chapter{第七章，Flink与外部系统的交互}
+\chapter{Flink与外部系统的交互}
 
-\chapter{第八章，Flink Table API \& SQL}
+\chapter{Flink Table API \& SQL}
 
-\chapter{第九章，Flink CEP库的使用}
+\chapter{Flink CEP库的使用}
 
 \part{Flink的部署与运维}
 
-\chapter{第十章，Flink应用的监控}
+\chapter{Flink应用的监控}
 
-\chapter{第十一章，如何部署Flink集群}
+\chapter{如何部署Flink集群}
 
-\chapter{第十二章，Flink集群的高可用}
+\chapter{Flink集群的高可用}
 
 \part{Flink内核与优化}
 
-\chapter{第十三章，Flink运行时架构}
+\chapter{Flink运行时架构}
 
-\chapter{第十四章，Flink状态的原理}
+\chapter{Flink状态的原理}
 
-\chapter{第十五章，Flink的容错机制}
+\chapter{Flink的容错机制}
 
-\chapter{第十六章，Flink作业的调度}
+\chapter{Flink作业的调度}
 
-\chapter{第十七章，Flink内存管理的特点}
+\chapter{Flink内存管理的特点}
 
-\chapter{第十八章，Flink的网络IO机制}
+\chapter{Flink的网络IO机制}
 
-\chapter{第十九章，Flink常见优化措施}
+\chapter{Flink常见优化措施}
 
-\chapter{第二十章，流的去重及其优化}
+\epigraph{过早优化是万恶之源。}{高德纳}
+
+任何程序的编写其实遵循三个阶段。第一，编写出一个可以运行的程序。第二，确保这个程
+序是正确的。第三，优化这个程序。所以高德纳才说：“过早优化是万恶之源”。而Flink
+程序与其他的程序的优化策略的基本道理是一样的，也就是尽量减少计算密集型和IO密集型
+这两种运算。
+
+我们先来看一下在开发Flink程序时常犯的一些错误：
+
+首先Flink的程序开发流程如下图所示：
+
+
+\begin{tikzpicture}
+\node[box] (1) at(0,0) {项目启动};
+\node[box] (2) at(4,0) {需求分析};
+\node[box] (3) at(8,0) {程序开发};
+\node[box] (4) at(0,-4) {(测试)};
+\node[box] (5) at(4,-4) {部署};
+\node[box] (6) at(8,-4) {维护};
+\draw[->] (1)--(2);
+\draw[->] (2)--(3);
+\draw[->] (3)--(4);
+\draw[->] (4)--(5);
+\draw[->] (5)--(6);
+\end{tikzpicture}
+
+\section{在项目启动的时候}
+
+\begin{itemize}
+\item 不使用一种迭代式的开发，而是想要毕其功于一役。
+\item 刚学了一些Flink基础知识，就想用Flink来解决公司最难的需求。
+\item 事先没有流处理的知识，直接开始使用Flink进行编程。
+\item 事先没有经过Flink编程方面的训练，例如：基本API的熟悉，基本的调优训练等等。
+\item 不和社区进行交流，不在社区中搜索可能已经存在的答案。例如不使用
+  StackOverflow、Flink Documentation、Flink Jira等常见工具。
+\end{itemize}
+
+\section{在分析需求的时候}
+
+\begin{itemize}
+\item 不考虑程序的一致性，例如是否允许丢失数据，是否允许数据重复计算。
+\item 不考虑程序后续的迭代和程序
+\item 不考虑需要解决的问题的规模，例如数据量的大小，数据流高峰期的数据量等等。
+\item 没有细致的分析真实的业务需求
+\end{itemize}
+
+\section{在开发的时候}
+
+\begin{itemize}
+\item 没有细致思考到底使应该使用DataStream API还是Table API \& SQL？
+\item 对Flink的类型系统理解不深，盲目使用了嵌套过深或者非常复杂的数据结构（例如
+  深度嵌套的POJO CLASS或者case class）
+\item 胡乱使用keyBy()函数
+\item 在不同的任务之间共享静态变量，从而造成了死锁、竞争等同步问题。
+\item 在UDF函数中随意开启新的线程，会造成非常难以调试的bug，例如检查点相关的问题。
+\item 随便自定义窗口函数，而没有使用Flink默认的函数。
+\item 没有将初始化的代码放在富函数的open方法中，而是放在了例如flatMap、map、
+  filter函数中。
+\end{itemize}
+
+\section{维护}
+
+由于Flink更新非常频繁，所以不要随便对程序进行升级。
+
+\chapter{流的去重及其优化}
+
+\chapter{如何解决数据倾斜}
 
 \part{Flink实时数仓项目}
 

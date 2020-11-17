@@ -7,6 +7,8 @@
     "latex2e"
     "elegantbook"
     "elegantbook11"
+    "tikz"
+    "epigraph"
     "array")
    (TeX-add-symbols
     '("ccr" 1)))
