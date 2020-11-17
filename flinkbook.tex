@@ -1,5 +1,6 @@
 \documentclass[cn,11pt,chinese]{elegantbook}
 \usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows}
 \usepackage{epigraph}
 
 
@@ -29,6 +30,12 @@ inner sep=5pt, %文字和边框的距离
 draw=blue %边框颜色
 }
 }
+
+\tikzstyle{startstop} = [rectangle, rounded corners, minimum width=3cm, minimum height=1cm,text centered, draw=black, fill=red!30]
+\tikzstyle{io} = [trapezium, trapezium left angle=70, trapezium right angle=110, minimum width=3cm, minimum height=1cm, text centered, draw=black, fill=blue!30]
+\tikzstyle{process} = [rectangle, minimum width=3cm, minimum height=1cm, text centered, draw=black, fill=orange!30]
+\tikzstyle{decision} = [diamond, minimum width=3cm, minimum height=1cm, text centered, draw=black, fill=green!30]
+\tikzstyle{arrow} = [thick,->,>=stealth]
 \begin{document}
 
 \begin{tikzpicture}
@@ -96,7 +103,6 @@ draw=blue %边框颜色
 
 首先Flink的程序开发流程如下图所示：
 
-
 \begin{tikzpicture}
 \node[box] (1) at(0,0) {项目启动};
 \node[box] (2) at(4,0) {需求分析};
@@ -111,7 +117,7 @@ draw=blue %边框颜色
 \draw[->] (5)--(6);
 \end{tikzpicture}
 
-\section{在项目启动的时候}
+\section{项目启动}
 
 \begin{itemize}
 \item 不使用一种迭代式的开发，而是想要毕其功于一役。
@@ -122,16 +128,30 @@ draw=blue %边框颜色
   StackOverflow、Flink Documentation、Flink Jira等常见工具。
 \end{itemize}
 
-\section{在分析需求的时候}
+\section{分析需求}
 
 \begin{itemize}
 \item 不考虑程序的一致性，例如是否允许丢失数据，是否允许数据重复计算。
+
+\begin{tikzpicture}[node distance=2cm]
+ %定义流程图具体形状
+\node (1) [startstop] {是否关心数据丢失？};
+\node (2) [startstop, below of=1] {需要结果的正确吗？};
+\node (3) [startstop, right of=2] {任何数据源，无须做检查点};
+\node (4) [startstop, below of=2] {允许重复计算吗？};
+\node (5) [startstop, right of=2] {CheckpointingMode.AT\_LEAST\_ONCE且数据源可重置};
+\node (6) [startstop, below of=4] {CheckpointingMode.EXACTLY\_ONCE且数据源可重置};
+
+ %连接具体形状
+\draw [arrow](1) -- (2);
+\end{tikzpicture}
+  
 \item 不考虑程序后续的迭代和程序
 \item 不考虑需要解决的问题的规模，例如数据量的大小，数据流高峰期的数据量等等。
 \item 没有细致的分析真实的业务需求
 \end{itemize}
 
-\section{在开发的时候}
+\section{开发}
 
 \begin{itemize}
 \item 没有细致思考到底使应该使用DataStream API还是Table API \& SQL？
@@ -144,6 +164,10 @@ draw=blue %边框颜色
 \item 没有将初始化的代码放在富函数的open方法中，而是放在了例如flatMap、map、
   filter函数中。
 \end{itemize}
+
+\section{测试}
+
+\section{部署}
 
 \section{维护}
 
