@@ -99,7 +99,7 @@ draw=blue %边框颜色
 程序与其他的程序的优化策略的基本道理是一样的，也就是尽量减少计算密集型和IO密集型
 这两种运算。
 
-我们先来看一下在开发Flink程序时常犯的一些错误：
+我们先来看一下在开发Flink程序时需要注意的一些要点和常犯的一些错误：
 
 首先Flink的程序开发流程如下图所示：
 
@@ -119,6 +119,8 @@ draw=blue %边框颜色
 
 \section{项目启动}
 
+在项目启动时，如果我们想要使用Flink来进行开发，那么可能会犯以下一些错误：
+
 \begin{itemize}
 \item 不使用一种迭代式的开发，而是想要毕其功于一役。
 \item 刚学了一些Flink基础知识，就想用Flink来解决公司最难的需求。
@@ -133,24 +135,36 @@ draw=blue %边框颜色
 \begin{itemize}
 \item 不考虑程序的一致性，例如是否允许丢失数据，是否允许数据重复计算。
 
+下面的流程图展示了我们在写Flink程序时，有关数据一致性方面，需要考虑到的一些选项。
+
+在使用Flink编写端到端(source -> transformation -> sink)的流处理程序时有这样一些一致性级别：
+
+\begin{itemize}
+\item at-most-once: 如果应用场景为传感器数据的实时监控，则丢失数据也是可以接受的。
+\item at-least-once
+\item exactly-once
+\end{itemize}
+
 \begin{tikzpicture}[node distance=2cm]
  %定义流程图具体形状
 \node (1) [process] {是否关心数据丢失？};
 \node (2) [process, below of=1] {需要结果的正确吗？};
 \node (3) [process, right of=2, xshift=5cm] {任何数据源，无须做检查点};
-\node (4) [process, below of=2] {允许重复发送正确的计算结果吗？};
+\node (4) [process, below of=2] {不允许重复发送正确的计算结果吗？};
 \node (5) [process, right of=4, xshift=5cm] {CheckpointingMode\\.AT\_LEAST\_ONCE且数据源可重置};
-\node (6) [process, below of=5] {CheckpointingMode\\.EXACTLY\_ONCE且数据源可重置};
+\node (6) [process, below of=4, yshift=-1cm] {CheckpointingMode\\.EXACTLY\_ONCE且数据源可重置且事务性写入第三方设备};
+\node (7) [process, right of=6, xshift=5cm, yshift=-1cm] {CheckpointingMode\\.EXACTLY\_ONCE且数据源可重置};
 
  %连接具体形状
 \draw [arrow](1) -- node [anchor=east] {是} (2);
 \draw [arrow](1) -- node [anchor=south] {否} (3);
 \draw [arrow](2) -- node [anchor=east] {是} (4);
 \draw [arrow](2) -- node [anchor=south] {否} (5);
-\draw [arrow](4) -- node [anchor=south] {否} (6);
+\draw [arrow](4) -- node [anchor=east] {是} (6);
+\draw [arrow](4) -- node [anchor=south] {否} (7);
 \end{tikzpicture}
   
-\item 不考虑程序后续的迭代和程序
+\item 不考虑程序后续的迭代和升级
 \item 不考虑需要解决的问题的规模，例如数据量的大小，数据流高峰期的数据量等等。
 \item 没有细致的分析真实的业务需求
 \end{itemize}
@@ -159,9 +173,101 @@ draw=blue %边框颜色
 
 \begin{itemize}
 \item 没有细致思考到底使应该使用DataStream API还是Table API \& SQL？
+
+  我们先来看一下DataStream API的特点：
+
+  \begin{itemize}
+  \item 流中的数据类型是Java或者Scala的Class类型。
+  \item 使用的是一系列转换操作符。
+  \item 程序按照我们编写的操作符的顺序运行。
+  \item 可以对状态进行显式的控制。
+  \item 可以对时间语义进行显式的控制。
+  \end{itemize}
+
+  而Table API \& SQL本质上是声明式编程，所以很多底层的细节我们从代码中无法很容易
+  的看出来。SQL的特点是：
+
+  \begin{itemize}
+  \item 我们可以声明表的Schema，也就是表结构。
+  \item 我们可以使用SQL这样通用的声明式编程语言。
+  \item Flink底层会为我们进行优化，也就意味着我们无法从SQL层面来进行一些细致的
+      优化。
+  \item 从我们编写的SQL程序中看不出状态是如何被操作的。
+  \item Flink底层决定何时去触发（Trigger）计算的执行。
+  \end{itemize}
+
+  那么我们什么时候避免使用Flink SQL呢？
+
+  \begin{itemize}
+  \item 当升级Flink版本或者我们自己编写的程序需要升级时，我们需要迁移状态。
+  \item 程序运行时，迟到数据不能被丢弃。
+  \item 在运行时，希望动态的改变程序的行为。
+  \end{itemize}
+  
 \item 对Flink的类型系统理解不深，盲目使用了嵌套过深或者非常复杂的数据结构（例如
   深度嵌套的POJO CLASS或者case class）
+
+  我们在编写Flink程序的时候，流里面的数据类型如果是POJO CLASS或者CASE CLASS，那
+  么字段类型最好是基本数据结构，例如Integer，String等。而不是其他嵌套的POJO或者
+  样例类。如果数据类型本身很复杂，例如嵌套很深的JSON字符串，那么最好将所有没用的
+  字段全部使用map操作符清晰掉，并展平成结构简单的数据结构。例如：
+
+  \begin{lstlisting}
+    {
+      "name": "atguigu",
+      "age": 10
+    }
+
+  \end{lstlisting}
+  
 \item 胡乱使用keyBy()函数
+
+  由于KeySelectors中的getKey方法可以返回任意的序列化类型，所以随便定义Key。而Key
+  最好是简单数据类型，如String，Tuple，POJO等。
+
+  我们可以看一下各种序列化类型的代价：
+
+  \begin{table}[htbp!]
+    \centering
+    \caption{序列化类型的代价}
+    \begin{tabular}{ll}
+      \toprule
+      序列化器 & Objects Per Second \\
+      \midrule
+      PojoSerializer & 813 \\
+      Kryo & 294 \\
+      Avro (Reflect API) & 114 \\
+      Avro (SpecificRecord API) & 632 \\
+      \bottomrule
+    \end{tabular}%
+  \end{table}%
+
+  通过上面的表可以看出，Key的类型至关重要，因为Key会作为状态被保存下来，定时器作
+  为状态被保存也同时需要保存Key。而序列化的时间复杂度是不能忽略的。所以我们尽量
+  使用简单的数据类型，例如：Integer、String、POJO类和Avro SpecificRecord类型等。
+  总而言之，Key的类型越简单越好。
+
+  \begin{lstlisting}
+  sourceStream
+      // 在反序列化器中，要将数据反序列化的越简单越好！
+      .flatMap(new Deserializer())
+      // key最好要很简单！
+      .keyBy("key")
+      .timeWindow()
+      .count()
+      .addSink()
+  \end{lstlisting}
+
+  例如不要将没用的字段保留下来，如下面的例子：
+
+  \begin{lstlisting}
+    public class Event {
+      public String key;
+      // 没用的字段都去掉！
+      public String unusedField;
+    } 
+  \end{lstlisting}
+  
 \item 在不同的任务之间共享静态变量，从而造成了死锁、竞争等同步问题。
 \item 在UDF函数中随意开启新的线程，会造成非常难以调试的bug，例如检查点相关的问题。
 \item 随便自定义窗口函数，而没有使用Flink默认的函数。
