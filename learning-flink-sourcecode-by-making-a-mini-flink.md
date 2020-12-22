@@ -29,6 +29,36 @@
 
 经过删改以后，我将flink原本的一百多万行代码删改到了10万行，而没有损失flink的基本功能，也就是说核心的引擎并没有受到破坏。还顺便发现了一处变量的命名错误，并提交了pull request，**成为了flink的源码贡献者:)**。我大概做了以下修改：
 
-* 删除了flink的一些库，例如flink table，flink cep等libraries。
-* 将flink每个库的测试代码全部删除，也就是每个lib的tests文件夹。
+* 删除了flink的一些库，例如flink table，flink cep等libraries。只剩下这几个库：flink-core, flink-runtime, flink-java, flink-streaming-java, flink-metrics, flink-optimizer。
+* 将flink每个库的测试代码全部删除，也就是每个lib的tests文件夹。进行到现在，大概剩下30万行java代码。接下来，真正的挑战开始了。因为这几个模块有互相依赖的关系。随便删除一个模块甚至一个文件，都会爆红一大片。
 * 将flink核心代码库例如flink-core，flink-runtime等lib中的统计模块代码flink-metrics删除，由于metrics代码耦合在flink源码的很多文件中，所以删除起来很麻烦，因为需要修改很多函数的签名或者类的定义等等。
+* 将flink-optimizer删除。
+* 将文件系统相关的代码删除，因为word count程序并没有用到文件的读写。而且文件系统相关代码也不是flink计算引擎的核心部件。这部分工作量也很大，因为文件系统的代码也分散在了flink源码中很多的地方。
+* 修改代码：将一些运行代码时用不到的接口实现、条件语句、异常处理等代码删去，因为这些代码在运行的时候用不到，而且在阅读源码时，使我们抓不到重点。如果将这些代码删去，在看源码时将会很清爽，也方便加注释。举个例子：由于我在运行程序时，使用的是Intellij IDEA本地运行，所以其实使用的是MiniCluster这个迷你集群。而flink的执行器接口是`PipelineExecutor`，共有好几个实现：`LocalExecutor`，`EmbeddedExecutor`，`RemoteExecutor`，`AbstractJobClusterExecutor`，`AbstractSessionClusterExecutor`；而由于我们只使用了`LocalExecutor`这一个实现，所以其余的都可以删除。这样读代码会方便很多。
+* 由于flink的master节点会开启一个web ui，所以web ui也需要去掉，由于web ui中涉及到flink的metrics数据的展示，以及耦合在其他的一些代码里，在删除的时候颇费了一些周折。
+* 逐一阅读各个模块，找出没有用到的代码，然后移除。
+* 很重要的一点：使用git来管理项目，每删改一些代码，就进行commit操作，这样在改了代码以后，如果程序跑不通，可以回滚到之前可以跑通的代码！
+
+经过以上一系列步骤，可以将flink源码删改至10万行左右，迷你flink就诞生了。
+
+## 收获了什么
+
+其实收获非常多，比如成了源码贡献者:)，哈哈，其实主要不是这个。
+
+这里要强调一点，提高写程序能力的唯一方法就是不断的写代码，不断的写没写过的代码，不断的写不熟悉的代码！
+
+收获大概有以下一些：
+
+1. 看到了Java高手是如何写代码的。其实我之前并没有阅读过大型的Java项目的代码，所以很多Java开发才使用到的技术并没有特别关注。之前读过大型的代码库大概是像C语言，Python，JavaScript，Golang，还有一些比较冷门的语言例如OCaml之类的。这次阅读flink代码，确实学到了不少Java开发相对高级一些的技术。例如，Java的设计模式具体是如何使用的。如何使用各种设计模式将大型项目解耦，可以说各种设计模式，对于Java而言是不得不用的技术。
+
+2. 其他语言例如Python的协程，JavaScript的Promise这些异步编程方式在Java中是如何使用的，具体来讲就是Java的Future这一特性，在flink中得到了大量的使用，有关并发的操作都是由Future这一特性来实现的。
+
+3. flink源码中大量使用了泛型，虽然Java的泛型比之类型系统更加强大的语言（Scala, Haskell, Ocaml等）有所欠缺，但Java本着实用主义的态度，设计出来的泛型也能达到很好的使用效果。
+
+4. flink底层通信依赖Scala编写的Akka这一著名的Actor模式的并发库（来源于Erlang）。由于之前并没有Akka的使用经验，因此借此机会好好的学习了一下Actor模式的并发是如何实现的。以及在Java中如何去使用Scala编写的库，或者说如何进行Java和Scala的混合编程。
+
+5. 最重要的一点就是发现flink中蕴含了很多优秀的设计思想，可以说是集很多年来分布式系统领域发展的大成。
+
+6. 收获还有很多很多，例如学到使用Java如何实现元组，Either这样的在函数式编程语言(Scala，Haskell)中才有的数据结构，如何正确的使用Executor管理线程池。
+
+在我发现一个微小的拼写错误并提交修复以后，代码很快就得到了合并。说明flink社区非常有活力，发展速度非常快。未来大有可期。
