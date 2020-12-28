@@ -2,6 +2,109 @@
 
 我们找一个最简单的flink程序word count来分析源码。
 
+```java
+public class WordCount {
+
+	public static void main(String[] args) throws Exception {
+
+        // 获取运行时环境
+		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+		env.setParallelism(1);
+		DataStream<String> text = env.fromElements("hello world", "hello world");
+
+		DataStream<Tuple2<String, Integer>> counts = text
+			.flatMap(new Tokenizer())
+			.setParallelism(1)
+			.filter(r -> r.f0.equals("hello"))
+			.setParallelism(2)
+			.keyBy(r -> r.f0)
+			.reduce(
+				new ReduceFunction<Tuple2<String, Integer>>() {
+					@Override
+					public Tuple2<String, Integer> reduce(Tuple2<String, Integer> value1, Tuple2<String, Integer> value2) throws Exception {
+						return Tuple2.of(value1.f0, value1.f1 + value2.f1);
+					}
+				}
+			)
+			.setParallelism(2);
+
+		counts.print();
+
+		env.execute("Streaming WordCount");
+	}
+
+	public static final class Tokenizer implements FlatMapFunction<String, Tuple2<String, Integer>> {
+
+		@Override
+		public void flatMap(String value, Collector<Tuple2<String, Integer>> out) {
+			String[] tokens = value.toLowerCase().split("\\W+");
+
+			for (String token : tokens) {
+				if (token.length() > 0) {
+					out.collect(new Tuple2<>(token, 1));
+				}
+			}
+		}
+	}
+
+}
+```
+
+程序执行的流程图
+
+```
++----------------+
+| 获取运行时环境 |
++----------------+
+        |
+        |
+        v
++---------------+
+| 构建数据流图  |
++---------------+
+       |
+       |
+       v
++-------------+
+|  执行程序   |
++-------------+
+```
+
+在上面的word count程序中， 我们首先获取了运行时环境。
+
+```java
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+```
+
+然后使用flink的DataStream API构建了数据流图。
+
+```java
+DataStream<Tuple2<String, Integer>> counts = text
+	.flatMap(new Tokenizer())
+	.setParallelism(1)
+	.filter(r -> r.f0.equals("hello"))
+	.setParallelism(2)
+	.keyBy(r -> r.f0)
+	.reduce(
+		new ReduceFunction<Tuple2<String, Integer>>() {
+			@Override
+			public Tuple2<String, Integer> reduce(Tuple2<String, Integer> value1, Tuple2<String, Integer> value2) throws Exception {
+				return Tuple2.of(value1.f0, value1.f1 + value2.f1);
+			}
+		}
+	)
+	.setParallelism(2);
+
+counts.print();
+```
+
+然后开始执行程序
+
+```java
+env.execute("flink job");
+```
+
 那么从哪里开始看起呢？从`execute`开始看起。
 
 也就是以下一行：
