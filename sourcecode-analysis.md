@@ -27,6 +27,7 @@ return execute(getStreamGraph(jobName));
 
 我们都知道，flink里面图的数据结构的转换模式是：
 
+```
 +----------------+
 |  StreamGraph   |
 +----------------+
@@ -42,7 +43,8 @@ return execute(getStreamGraph(jobName));
 +----------------+
 | ExecutionGraph |
 +----------------+
-    
+```
+ 
 也就是说先将StreamGraph转换成JobGraph，然后再从JobGraph转换成ExecutionGraph。    
 
 而`getStreamGraph`就是用来获取`StreamGraph`数据结构的。
