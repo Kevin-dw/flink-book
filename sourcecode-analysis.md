@@ -58,17 +58,97 @@ return getStreamGraph(jobName, true);
 看的出来，还要继续点击，继续点击来到了同文件的`1990`行，以下是函数体
 
 ```java
-1990	public StreamGraph getStreamGraph(String jobName, boolean clearTransformations) {
-1991		StreamGraph streamGraph = getStreamGraphGenerator().setJobName(jobName).generate();
-1992		if (clearTransformations) {
-1993			this.transformations.clear();
-1994		}
-1995		return streamGraph;
-1996	}
+1990    public StreamGraph getStreamGraph(String jobName, boolean clearTransformations) {
+1991        StreamGraph streamGraph = getStreamGraphGenerator().setJobName(jobName).generate();
+1992        if (clearTransformations) {
+1993            this.transformations.clear();
+1994        }
+1995        return streamGraph;
+1996    }
 ```
 
 第1991行代码，产生了一个StreamGraph，而第1995行代码，返回了这个StreamGraph。
-    
-    
+
+## 如何生成StreamGraph
+
+我们可以看一下第1991行
+
+```java
+1991  StreamGraph streamGraph = getStreamGraphGenerator().setJobName(jobName).generate();
+```
+
+这里面有分成了两步
+
+1. `getStreamGraphGenerator`用来获取`StreamGraph`的生成器。
+2. `generate()`用来生成`StreamGraph`。
+
+点击`getStreamGraphGenerator`进去一探究竟。
+
+```java
+1998    private StreamGraphGenerator getStreamGraphGenerator() {
+1999        if (transformations.size() <= 0) {
+2000            throw new IllegalStateException("No operators defined in streaming topology. Cannot execute.");
+2001        }
+
+2003        final RuntimeExecutionMode executionMode =
+2004                configuration.get(ExecutionOptions.RUNTIME_MODE);
+
+2006        return new StreamGraphGenerator(transformations, config, checkpointCfg, getConfiguration())
+2007            .setRuntimeExecutionMode(executionMode)
+2008            .setStateBackend(defaultStateBackend)
+2009            .setChaining(isChainingEnabled)
+2010            .setUserArtifacts(cacheFile)
+2011            .setTimeCharacteristic(timeCharacteristic)
+2012            .setDefaultBufferTimeout(bufferTimeout);
+2013    }
+```
+
+从2006行开始，对StreamGraph进行了一系列的配置。
+
+然后，我们需要点击进入1991行的`generate`函数去一探究竟。
+
+```java
+252  public StreamGraph generate() {
+253     streamGraph = new StreamGraph(executionConfig, checkpointConfig, savepointRestoreSettings);
+254     shouldExecuteInBatchMode = shouldExecuteInBatchMode(runtimeExecutionMode);
+255     configureStreamGraph(streamGraph);
+256
+257     alreadyTransformed = new HashMap<>();
+258
+259     for (Transformation<?> transformation: transformations) {
+260         transform(transformation);
+261     }
+262
+263     final StreamGraph builtStreamGraph = streamGraph;
+264
+265     alreadyTransformed.clear();
+266     alreadyTransformed = null;
+267     streamGraph = null;
+268
+269     return builtStreamGraph;
+270  }
+```
+
+第253行实例化了一个`StreamGraph`，而最关键的就是第260行。这一行代码将`transformation`进一步做了转换。
+
+`transform`函数将`transformations`这个列表，转换成了一个整数数组。
+
+这个整数数组是什么呢？这个整数数组里面包含了我们将算子转换成了的整数ID。
+
+例如，我们的代码
+
+```java
+env.fromElements(1,2,3)
+```
+
+是一个数据源算子，这个数据源算子被`transform`编码成了`1`。
+
+再比如，我们的代码
+
+```java
+.filter(r -> r.f0.equals("a"))
+```
+
+这是一个filter算子，被转换成了`3`。等等。转换成数字以后方便处理。
     
     
