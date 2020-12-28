@@ -105,6 +105,29 @@ counts.print();
 env.execute("flink job");
 ```
 
+## 获取运行时环境
+
+我们使用`getExecutionEnvironment()`方法获取了运行时环境。运行时环境是一个类，也就是`StreamExecutionEnvironment.java`这个文件。
+
+这个运行时环境类有很多属性和方法，那么这里我们重点关注一个属性：
+
+```java
+protected final List<Transformation<?>> transformations = new ArrayList<>();
+```
+
+这个`transformations`是一个链表。那么里面保存了什么呢？
+
+```
+0 = {OneInputTransformation@2148} "OneInputTransformation{id=2, name='Flat Map', outputType=Java Tuple2<String, Integer>, parallelism=1}"
+1 = {OneInputTransformation@2149} "OneInputTransformation{id=3, name='Filter', outputType=Java Tuple2<String, Integer>, parallelism=2}"
+2 = {OneInputTransformation@2150} "OneInputTransformation{id=5, name='Keyed Reduce', outputType=Java Tuple2<String, Integer>, parallelism=2}"
+3 = {SinkTransformation@2151} "SinkTransformation{id=6, name='Print to Std. Out', outputType=null, parallelism=1}"
+```
+
+我们可以看到链表中的每一个元素都是一个转换算子，并且里面有算子的名字、输出类型、并行度等信息。
+
+那么这个`transformations`数组是如何构建出来的呢？
+
 那么从哪里开始看起呢？从`execute`开始看起。
 
 也就是以下一行：
