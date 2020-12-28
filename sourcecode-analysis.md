@@ -126,7 +126,64 @@ protected final List<Transformation<?>> transformations = new ArrayList<>();
 
 我们可以看到链表中的每一个元素都是一个转换算子，并且里面有算子的名字、输出类型、并行度等信息。
 
+例如索引为2的元素是一个`Keyed Reduce`转换，输出类型是`Tuple2<String, Integer>`，并行度是2。
+
 那么这个`transformations`数组是如何构建出来的呢？
+
+## 使用DataStream API构建transformations
+
+我们使用了以下代码来构建transformations数组
+
+```java
+stream.flatMap(...).keyBy().reduce(...);
+```
+
+例如我们分析一下flatMap算子, 点击flatMap进入源码。
+
+```java
+public <R> SingleOutputStreamOperator<R> flatMap(FlatMapFunction<T, R> flatMapper) {
+
+    // 获取算子的输出类型
+	TypeInformation<R> outType = TypeExtractor.getFlatMapReturnTypes(clean(flatMapper),
+			getType(), Utils.getCallLocationName(), true);
+
+    // 将flatMap算子添加到transformations数组中，请点击`flatMap`
+	return flatMap(flatMapper, outType);
+}
+```
+
+可以看到是
+
+```java
+public <R> SingleOutputStreamOperator<R> flatMap(FlatMapFunction<T, R> flatMapper, TypeInformation<R> outputType) {
+    // 点击`transform`
+	return transform("Flat Map", outputType, new StreamFlatMap<>(clean(flatMapper)));
+}
+```
+
+来到了
+
+```java
+// 点击`doTransform`
+return doTransform(operatorName, outTypeInfo, SimpleOperatorFactory.of(operator));
+```
+
+来到了`doTransform`函数，里面有一句代码很重要
+
+```java
+getExecutionEnvironment().addOperator(resultTransform);
+```
+
+可以注意到这行代码中有一个`addOperator`方法，这个方法将`flatMap`作为操作符添加到`transformations`数组中。
+
+因为`addOperator`的代码是
+
+```java
+this.transformations.add(transformation);
+```
+
+将flatMap算子添加到了transformations中。
+
 
 那么从哪里开始看起呢？从`execute`开始看起。
 
