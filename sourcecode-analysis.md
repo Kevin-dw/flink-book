@@ -720,6 +720,270 @@ setChaining会对source调用createChain方法，该方法会递归调用下游�
 
 本章主要对 Flink 中将 StreamGraph 转变成 JobGraph 的核心源码进行了分析。思想还是很简单的，StreamNode 转成 JobVertex，StreamEdge 转成 JobEdge，JobEdge 和 JobVertex 之间创建 IntermediateDataSet 来连接。关键点在于将多个 SteamNode chain 成一个 JobVertex的过程，这部分源码比较绕，有兴趣的同学可以结合源码单步调试分析。下一章将会介绍 JobGraph 提交到 JobManager 后是如何转换成分布式化的 ExecutionGraph 的。
 
+## 如何生成 ExecutionGraph
+
+在前两章中介绍的 StreamGraph 和 JobGraph 都是在 client 端生成的，本章将会讲述 JobGraph 是如何转换成 ExecutionGraph 的。当 JobGraph 从 client 端提交到 JobManager 端后，JobManager 会根据 JobGraph 生成对应的 ExecutionGraph，ExecutionGraph 是 Flink 作业调度时使用到的核心数据结构，它包含每一个并行的 task、每一个 intermediate stream 以及它们之间的关系，本篇将会详细分析一下 JobGraph 转换为 ExecutionGraph 的流程。
+
+### Create ExecutionGraph 的整体流程
+
+当用户向一个 Flink 集群提交一个作业后，JobManager 会接收到 Client 相应的请求，JobManager 会先做一些初始化相关的操作（也就是 JobGraph 到 ExecutionGraph 的转化），当这个转换完成后，才会根据 ExecutionGraph 真正在分布式环境中调度当前这个作业，而 JobManager 端处理的整体流程如下：
+
+上图是一个作业提交后，在 JobManager 端的处理流程，本篇文章主要聚焦于 ExecutionGraph 的生成过程，也就是图中的红色节点，即 ExecutionGraphBuilder 的 buildGraph() 方法，这个方法就是根据 JobGraph 及相关的配置来创建 ExecutionGraph 对象的核心方法。
+
+### 具体实现逻辑
+
+#### 基本概念
+
+ExecutionGraph 引入了几个基本概念，先简单介绍一下这些概念，对于理解 ExecutionGraph 有较大帮助：
+
+* ExecutionJobVertex: 在 ExecutionGraph 中，节点对应的是 ExecutionJobVertex，它是与 JobGraph 中的 JobVertex 一一对应，实际上每个 ExexutionJobVertex 也都是由一个 JobVertex 生成；
+* ExecutionVertex: 在 ExecutionJobVertex 中有一个 taskVertices 变量，它是 ExecutionVertex 类型的数组，数组的大小就是这个 JobVertex 的并发度，在创建 ExecutionJobVertex 对象时，会创建相同并发度梳理的 ExecutionVertex 对象，在真正调度时，一个 ExecutionVertex 实际就是一个 task，它是 ExecutionJobVertex 并行执行的一个子任务；
+* Execution: Execution 是对 ExecutionVertex 的一次执行，通过 ExecutionAttemptId 来唯一标识，一个 ExecutionVertex 在某些情况下可能会执行多次，比如遇到失败的情况或者该 task 的数据需要重新计算时；
+* IntermediateResult: 在 JobGraph 中用 IntermediateDataSet 表示 JobVertex 的输出 stream，一个 JobGraph 可能会有多个输出 stream，在 ExecutionGraph 中，与之对应的就是 IntermediateResult 对象；
+* IntermediateResultPartition: 由于 ExecutionJobVertex 可能有多个并行的子任务，所以每个 IntermediateResult 可能就有多个生产者，每个生产者的在相应的 IntermediateResult 上的输出对应一个 IntermediateResultPartition 对象，IntermediateResultPartition 表示的是 ExecutionVertex 的一个输出分区；
+* ExecutionEdge: ExecutionEdge 表示 ExecutionVertex 的输入，通过 ExecutionEdge 将 ExecutionVertex 和 IntermediateResultPartition 连接起来，进而在 ExecutionVertex 和 IntermediateResultPartition 之间建立联系。
+
+从这些基本概念中，也可以看出以下几点：
+
+1. 由于每个 JobVertex 可能有多个 IntermediateDataSet，所以每个 ExecutionJobVertex 可能有多个 IntermediateResult，因此，每个 ExecutionVertex 也可能会包含多个 IntermediateResultPartition；
+2. ExecutionEdge 这里主要的作用是把 ExecutionVertex 和 IntermediateResultPartition 连接起来，表示它们之间的连接关系。
+
+#### 实现细节
+
+ExecutionGraph 的生成是在 ExecutionGraphBuilder 的 buildGraph() 方法中实现的：
+
+```java
+	public static ExecutionGraph buildGraph(
+		@Nullable ExecutionGraph prior,
+		JobGraph jobGraph,
+		Configuration jobManagerConfig,
+		ScheduledExecutorService futureExecutor,
+		Executor ioExecutor,
+		SlotProvider slotProvider,
+		ClassLoader classLoader,
+		CheckpointRecoveryFactory recoveryFactory,
+		Time rpcTimeout,
+		RestartStrategy restartStrategy,
+		MetricGroup metrics,
+		BlobWriter blobWriter,
+		Time allocationTimeout,
+		Logger log,
+		ShuffleMaster<?> shuffleMaster,
+		JobMasterPartitionTracker partitionTracker,
+		FailoverStrategy.Factory failoverStrategyFactory,
+		ExecutionDeploymentListener executionDeploymentListener,
+		ExecutionStateUpdateListener executionStateUpdateListener,
+		long initializationTimestamp) throws JobExecutionException, JobException {
+
+		checkNotNull(jobGraph, "job graph cannot be null");
+
+		final String jobName = jobGraph.getName();
+		final JobID jobId = jobGraph.getJobID();
+
+		final JobInformation jobInformation = new JobInformation(
+			jobId,
+			jobName,
+			jobGraph.getSerializedExecutionConfig(),
+			jobGraph.getJobConfiguration(),
+			jobGraph.getUserJarBlobKeys(),
+			jobGraph.getClasspaths());
+
+		final int maxPriorAttemptsHistoryLength =
+				jobManagerConfig.getInteger(JobManagerOptions.MAX_ATTEMPTS_HISTORY_SIZE);
+
+		final PartitionReleaseStrategy.Factory partitionReleaseStrategyFactory =
+			PartitionReleaseStrategyFactoryLoader.loadPartitionReleaseStrategyFactory(jobManagerConfig);
+
+		// create a new execution graph, if none exists so far
+    // 如果不存在执行图，就创建一个新的执行图
+		final ExecutionGraph executionGraph;
+		try {
+			executionGraph = (prior != null) ? prior :
+				new ExecutionGraph(
+					jobInformation,
+					futureExecutor,
+					ioExecutor,
+					rpcTimeout,
+					restartStrategy,
+					maxPriorAttemptsHistoryLength,
+					failoverStrategyFactory,
+					slotProvider,
+					classLoader,
+					blobWriter,
+					allocationTimeout,
+					partitionReleaseStrategyFactory,
+					shuffleMaster,
+					partitionTracker,
+					jobGraph.getScheduleMode(),
+					executionDeploymentListener,
+					executionStateUpdateListener,
+					initializationTimestamp);
+		} catch (IOException e) {
+			throw new JobException("Could not create the ExecutionGraph.", e);
+		}
+
+		// set the basic properties
+
+		try {
+			executionGraph.setJsonPlan(JsonPlanGenerator.generatePlan(jobGraph));
+		}
+		catch (Throwable t) {
+			log.warn("Cannot create JSON plan for job", t);
+			// give the graph an empty plan
+			executionGraph.setJsonPlan("{}");
+		}
+
+		// initialize the vertices that have a master initialization hook
+		// file output formats create directories here, input formats create splits
+
+		final long initMasterStart = System.nanoTime();
+		log.info("Running initialization on master for job {} ({}).", jobName, jobId);
+
+		for (JobVertex vertex : jobGraph.getVertices()) {
+      // 获取作业图中的每个节点的执行类，检查一下有没有没有执行类的节点，防御式编程
+			String executableClass = vertex.getInvokableClassName();
+			if (executableClass == null || executableClass.isEmpty()) {
+				throw new JobSubmissionException(jobId,
+						"The vertex " + vertex.getID() + " (" + vertex.getName() + ") has no invokable class.");
+			}
+
+			try {
+        // 设置好每个节点的类加载器
+				vertex.initializeOnMaster(classLoader);
+			}
+			catch (Throwable t) {
+					throw new JobExecutionException(jobId,
+							"Cannot initialize task '" + vertex.getName() + "': " + t.getMessage(), t);
+			}
+		}
+
+		log.info("Successfully ran initialization on master in {} ms.",
+				(System.nanoTime() - initMasterStart) / 1_000_000);
+
+		// topologically sort the job vertices and attach the graph to the existing one
+    // 对JobGraph进行拓扑排序
+		List<JobVertex> sortedTopology = jobGraph.getVerticesSortedTopologicallyFromSources();
+		if (log.isDebugEnabled()) {
+			log.debug("Adding {} vertices from job graph {} ({}).", sortedTopology.size(), jobName, jobId);
+		}
+    // 将拓扑排序过的JobGraph添加到executionGraph数据结构中。
+    // 点击attachJobGraph函数
+		executionGraph.attachJobGraph(sortedTopology);
+
+		if (log.isDebugEnabled()) {
+			log.debug("Successfully created execution graph from job graph {} ({}).", jobName, jobId);
+		}
+
+		// 有关检查点的操作，略去
+
+		return executionGraph;
+	}
+```
+
+我们来看`attachJobGraph`
+
+```java
+	public void attachJobGraph(List<JobVertex> topologiallySorted) throws JobException {
+
+    // 断言，确保运行在JobMaster的主线程上面。
+		assertRunningInJobMasterMainThread();
+
+    // ExecutionJobVertex是执行图的节点
+		final ArrayList<ExecutionJobVertex> newExecJobVertices = new ArrayList<>(topologiallySorted.size());
+		final long createTimestamp = System.currentTimeMillis();
+
+		for (JobVertex jobVertex : topologiallySorted) {
+
+			if (jobVertex.isInputVertex() && !jobVertex.isStoppable()) {
+				this.isStoppable = false;
+			}
+
+			// create the execution job vertex and attach it to the graph
+      // 实例化执行图节点
+			ExecutionJobVertex ejv = new ExecutionJobVertex(
+					this,
+					jobVertex,
+					1,
+					maxPriorAttemptsHistoryLength,
+					rpcTimeout,
+					globalModVersion,
+					createTimestamp);
+
+      // 将执行图节点ejv与前驱节点相连
+			ejv.connectToPredecessors(this.intermediateResults);
+
+			ExecutionJobVertex previousTask = this.tasks.putIfAbsent(jobVertex.getID(), ejv);
+			if (previousTask != null) {
+				throw new JobException(String.format("Encountered two job vertices with ID %s : previous=[%s] / new=[%s]",
+					jobVertex.getID(), ejv, previousTask));
+			}
+
+			for (IntermediateResult res : ejv.getProducedDataSets()) {
+				IntermediateResult previousDataSet = this.intermediateResults.putIfAbsent(res.getId(), res);
+				if (previousDataSet != null) {
+					throw new JobException(String.format("Encountered two intermediate data set with ID %s : previous=[%s] / new=[%s]",
+						res.getId(), res, previousDataSet));
+				}
+			}
+
+			this.verticesInCreationOrder.add(ejv);
+      // 节点的总数量需要加上当前执行图节点的并行度，因为执行图是作业图的并行化版本，
+      // 并行化就体现在并行度上，一个并行度对应一个节点。
+			this.numVerticesTotal += ejv.getParallelism();
+      // 将当前执行图节点加入到图中
+			newExecJobVertices.add(ejv);
+		}
+
+		// the topology assigning should happen before notifying new vertices to failoverStrategy
+		executionTopology = DefaultExecutionTopology.fromExecutionGraph(this);
+
+		failoverStrategy.notifyNewVertices(newExecJobVertices);
+
+		partitionReleaseStrategy = partitionReleaseStrategyFactory.createInstance(getSchedulingTopology());
+	}
+```
+
+连接前驱节点的代码
+
+```java
+	public void connectToPredecessors(Map<IntermediateDataSetID, IntermediateResult> intermediateDataSets) throws JobException {
+
+    // 获取JobVertex的输入边组成的列表
+		List<JobEdge> inputs = jobVertex.getInputs();
+
+		for (int num = 0; num < inputs.size(); num++) {
+			JobEdge edge = inputs.get(num);
+
+			// fetch the intermediate result via ID. if it does not exist, then it either has not been created, or the order
+			// in which this method is called for the job vertices is not a topological order
+      // 通过ID获取中间结果。如果中间结果不存在，那么或者中间结果没有被创建。或者JobVertex没有进行拓扑排序。
+			IntermediateResult ires = intermediateDataSets.get(edge.getSourceId());
+			if (ires == null) {
+				throw new JobException("Cannot connect this job graph to the previous graph. No previous intermediate result found for ID "
+						+ edge.getSourceId());
+			}
+      // 将中间结果添加到输入中。注意这里this.inputs和上面inputs的区别
+			this.inputs.add(ires);
+      // 为中间结果注册消费者，这样中间结果的消费者又多了一个（就是当前节点）
+			int consumerIndex = ires.registerConsumer();
+      // 由于每一个并行度都对应一个节点。
+      // 所以要把每个节点都和前面的中间结果相连。
+			for (int i = 0; i < parallelism; i++) {
+				ExecutionVertex ev = taskVertices[i];
+				ev.connectSource(num, ires, edge, consumerIndex);
+			}
+		}
+	}
+```
+
+本章详细介绍了 JobGraph 如何转换为 ExecutionGraph 的过程。到这里，StreamGraph、 JobGraph 和 ExecutionGraph 的生成过程，已经详细讲述完了，后面将会逐步介绍 runtime 的其他内容。
+
+简单总结一下：
+
+* StreamGraph 是最原始的用户逻辑，是一个没有做任何优化的 DataFlow；
+* JobGraph 对 StreamGraph 做了一些优化，主要是将能够 Chain 在一起的算子 Chain 在一起，这一样可以减少网络IO的开销；
+* ExecutionGraph 则是作业运行用来调度的执行图，可以看作是并行化版本的 JobGraph，将 DAG 拆分到基本的调度单元。
+
 ## 深入分析flink的网络栈
 
 参考链接：https://flink.apache.org/2019/06/05/flink-network-stack.html
