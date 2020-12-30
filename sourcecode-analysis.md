@@ -59,6 +59,424 @@ Flink 中的执行图可以分成四层：StreamGraph -> JobGraph -> ExecutionGr
 
 首先我们看到，JobGraph 之上除了 StreamGraph 还有 OptimizedPlan。OptimizedPlan 是由 Batch API 转换而来的。StreamGraph 是由 Stream API 转换而来的。为什么 API 不直接转换成 JobGraph？因为，Batch 和 Stream 的图结构和优化方法有很大的区别，比如 Batch 有很多执行前的预分析用来优化图的执行，而这种优化并不普适于 Stream，所以通过 OptimizedPlan 来做 Batch 的优化会更方便和清晰，也不会影响 Stream。JobGraph 的责任就是统一 Batch 和 Stream 的图，用来描述清楚一个拓扑图的结构，并且做了 chaining 的优化，chaining 是普适于 Batch 和 Stream 的，所以在这一层做掉。ExecutionGraph 的责任是方便调度和各个 tasks 状态的监控和跟踪，所以 ExecutionGraph 是并行化的 JobGraph。而“物理执行图”就是最终分布式在各个机器上运行着的tasks了。所以可以看到，这种解耦方式极大地方便了我们在各个层所做的工作，各个层之间是相互隔离的。
 
+## 如何生成StreamGraph
+
+现在我们将介绍 Flink 是如何根据用户用Stream API编写的程序，构造出一个代表拓扑结构的StreamGraph的。
+
+StreamGraph 相关的代码主要在`org.apache.flink.streaming.api.graph`包中。构造StreamGraph的入口函数是`getStreamGraphGenerator().setJobName(jobName).generate()`。该函数会由触发程序执行的方法`StreamExecutionEnvironment.execute()`调用到。也就是说 StreamGraph 是在 Client 端构造的，这也意味着我们可以在本地通过调试观察 StreamGraph 的构造过程。
+
+### Transformation
+
+我们来看一下`generate()`函数的代码：
+
+```java
+	public StreamGraph generate() {
+		streamGraph = new StreamGraph(executionConfig, checkpointConfig, savepointRestoreSettings);
+		shouldExecuteInBatchMode = shouldExecuteInBatchMode(runtimeExecutionMode);
+		configureStreamGraph(streamGraph);
+
+		alreadyTransformed = new HashMap<>();
+
+		for (Transformation<?> transformation: transformations) {
+			transform(transformation);
+		}
+
+		final StreamGraph builtStreamGraph = streamGraph;
+
+		alreadyTransformed.clear();
+		alreadyTransformed = null;
+		streamGraph = null;
+
+		return builtStreamGraph;
+	}
+```
+
+这个函数位于`StreamGraphGenerator.java`类中。当这个类进行实例化时，有一个关键参数：`List<Transformation<?>> transformations`。而上面的`generate`函数就对这个关键参数做了操作。`Transformation`代表了从一个或多个DataStream生成新DataStream的操作。DataStream的底层其实就是一个`Transformation`，描述了这个DataStream是怎么来的。
+
+DataStream 上常见的 transformation 有 map、flatmap、filter等（见DataStream Transformation了解更多）。这些transformation会构造出一棵 Transformation 树，通过这棵树转换成 StreamGraph。比如 DataStream.map源码如下，其中SingleOutputStreamOperator为DataStream的子类：
+
+```java
+	public <R> SingleOutputStreamOperator<R> map(MapFunction<T, R> mapper) {
+    // 通过java reflection抽出mapper的返回值类型
+		TypeInformation<R> outType = TypeExtractor.getMapReturnTypes(clean(mapper), getType(),
+				Utils.getCallLocationName(), true);
+
+		return map(mapper, outType);
+	}
+
+	public <R> SingleOutputStreamOperator<R> map(MapFunction<T, R> mapper, TypeInformation<R> outputType) {
+    // 返回一个新的DataStream，StreamMap 为 StreamOperator 的实现类
+		return transform("Map", outputType, new StreamMap<>(clean(mapper)));
+	}
+
+	public <R> SingleOutputStreamOperator<R> transform(
+			String operatorName,
+			TypeInformation<R> outTypeInfo,
+			OneInputStreamOperator<T, R> operator) {
+
+		return doTransform(operatorName, outTypeInfo, SimpleOperatorFactory.of(operator));
+	}
+
+	protected <R> SingleOutputStreamOperator<R> doTransform(
+			String operatorName,
+			TypeInformation<R> outTypeInfo,
+			StreamOperatorFactory<R> operatorFactory) {
+
+		// read the output type of the input Transform to coax out errors about MissingTypeInfo
+		transformation.getOutputType();
+
+    // 新的transformation会连接上当前DataStream中的transformation，从而构建成一棵树
+		OneInputTransformation<T, R> resultTransform = new OneInputTransformation<>(
+				this.transformation,
+				operatorName,
+				operatorFactory,
+				outTypeInfo,
+				environment.getParallelism());
+
+		@SuppressWarnings({"unchecked", "rawtypes"})
+		SingleOutputStreamOperator<R> returnStream = new SingleOutputStreamOperator(environment, resultTransform);
+
+    // 所有的transformation都会存到 env 中，调用execute时遍历该list生成StreamGraph
+		getExecutionEnvironment().addOperator(resultTransform);
+
+		return returnStream;
+	}
+```
+
+从上方代码可以了解到，`map`转换将用户自定义的函数`MapFunction`包装到`StreamMap`这个Operator中，再将`StreamMap`包装到`OneInputTransformation`，最后该`transformation`存到`env`中，当调用`env.execute`时，遍历其中的`transformation`集合构造出`StreamGraph`。其分层实现如下图所示：
+
+![](./image/4.png)
+
+另外，并不是每一个`StreamTransformation`都会转换成 runtime 层中物理操作。有一些只是逻辑概念，比如 union、split/select、partition等。如下图所示的转换树，在运行时会优化成下方的操作图。
+
+![](./image/5.png)
+
+union、split/select、partition中的信息会被写入到 Source –> Map 的边中。通过源码也可以发现，UnionTransformation,SplitTransformation,SelectTransformation,PartitionTransformation由于不包含具体的操作所以都没有StreamOperator成员变量，而其他StreamTransformation的子类基本上都有。
+
+### StreamOperator
+
+DataStream 上的每一个 Transformation 都对应了一个 StreamOperator，StreamOperator是运行时的具体实现，会决定UDF(User-Defined Funtion)的调用方式。下图所示为 StreamOperator 的类图：
+
+![](./image/6.png)
+
+可以发现，所有实现类都继承了`AbstractStreamOperator`。另外除了 project 操作，其他所有可以执行UDF代码的实现类都继承自`AbstractUdfStreamOperator`，该类是封装了UDF的`StreamOperator`。UDF就是实现了`Function`接口的类，如`MapFunction`,`FilterFunction`。
+
+### 生成 StreamGraph 的源码分析
+
+我们通过在DataStream上做了一系列的转换（map、filter等）得到了Transformation集合，然后通过generate方法获得StreamGraph，该方法的源码如下：
+
+```java
+  // 对具体的一个transformation进行转换，转换成 StreamGraph 中的 StreamNode 和 StreamEdge
+  // 返回值为该transform的id集合，通常大小为1个（除FeedbackTransformation）
+	private Collection<Integer> transform(Transformation<?> transform) {
+    // 跳过已经转换过的transformation
+		if (alreadyTransformed.containsKey(transform)) {
+			return alreadyTransformed.get(transform);
+		}
+
+		LOG.debug("Transforming " + transform);
+
+		if (transform.getMaxParallelism() <= 0) {
+
+			// if the max parallelism hasn't been set, then first use the job wide max parallelism
+			// from the ExecutionConfig.
+			int globalMaxParallelismFromConfig = executionConfig.getMaxParallelism();
+			if (globalMaxParallelismFromConfig > 0) {
+				transform.setMaxParallelism(globalMaxParallelismFromConfig);
+			}
+		}
+
+    // 至少调用一次，如果获取不到输出类型，触发MissingTypeInfo异常。防御式编程。
+		transform.getOutputType();
+
+    // 获取翻译器，将map之类的算子翻译成OneInputTransformation
+		@SuppressWarnings("unchecked")
+		final TransformationTranslator<?, Transformation<?>> translator =
+				(TransformationTranslator<?, Transformation<?>>) translatorMap.get(transform.getClass());
+
+		Collection<Integer> transformedIds;
+		if (translator != null) {
+      // 执行翻译操作
+			transformedIds = translate(translator, transform);
+		} else {
+			transformedIds = legacyTransform(transform);
+		}
+
+    // 将处理过的转换操作加入已经转换过的集合中，不会重复处理
+		if (!alreadyTransformed.containsKey(transform)) {
+			alreadyTransformed.put(transform, transformedIds);
+		}
+
+		return transformedIds;
+	}
+
+	private Collection<Integer> translate(
+			final TransformationTranslator<?, Transformation<?>> translator,
+			final Transformation<?> transform) {
+		checkNotNull(translator);
+		checkNotNull(transform);
+
+		final List<Collection<Integer>> allInputIds = getParentInputIds(transform.getInputs());
+
+		// the recursive call might have already transformed this
+		if (alreadyTransformed.containsKey(transform)) {
+			return alreadyTransformed.get(transform);
+		}
+
+    // 确定任务槽的共享组，多个任务槽可能在一个组里
+		final String slotSharingGroup = determineSlotSharingGroup(
+				transform.getSlotSharingGroup(),
+				allInputIds.stream()
+						.flatMap(Collection::stream)
+						.collect(Collectors.toList()));
+
+		final TransformationTranslator.Context context = new ContextImpl(
+				this, streamGraph, slotSharingGroup, configuration);
+
+    // 由于我们是流式程序，所以会选择流式翻译器
+		return shouldExecuteInBatchMode
+				? translator.translateForBatch(transform, context)
+				: translator.translateForStreaming(transform, context);
+	}
+```
+
+以下是流式翻译器的代码：
+
+```java
+	@Override
+	public Collection<Integer> translateForStreaming(final T transformation, final Context context) {
+		checkNotNull(transformation);
+		checkNotNull(context);
+
+		final Collection<Integer> transformedIds =
+        // 点击以下函数，进入后面的代码
+				translateForStreamingInternal(transformation, context);
+		configure(transformation, context);
+
+		return transformedIds;
+	}
+
+	@Override
+	public Collection<Integer> translateForStreamingInternal(
+			final OneInputTransformation<IN, OUT> transformation,
+			final Context context) {
+    // 点击函数translateInternal
+		return translateInternal(transformation,
+			transformation.getOperatorFactory(),
+			transformation.getInputType(),
+			transformation.getStateKeySelector(),
+			transformation.getStateKeyType(),
+			context
+		);
+	}
+
+	protected Collection<Integer> translateInternal(
+			final Transformation<OUT> transformation,
+			final StreamOperatorFactory<OUT> operatorFactory,
+			final TypeInformation<IN> inputType,
+			@Nullable final KeySelector<IN, ?> stateKeySelector,
+			@Nullable final TypeInformation<?> stateKeyType,
+			final Context context) {
+		checkNotNull(transformation);
+		checkNotNull(operatorFactory);
+		checkNotNull(inputType);
+		checkNotNull(context);
+
+		final StreamGraph streamGraph = context.getStreamGraph();
+		final String slotSharingGroup = context.getSlotSharingGroup();
+		final int transformationId = transformation.getId();
+		final ExecutionConfig executionConfig = streamGraph.getExecutionConfig();
+
+    // 添加 StreamNode
+		streamGraph.addOperator(
+			transformationId,
+			slotSharingGroup,
+			transformation.getCoLocationGroupKey(),
+			operatorFactory,
+			inputType,
+			transformation.getOutputType(),
+			transformation.getName());
+
+		if (stateKeySelector != null) {
+			TypeSerializer<?> keySerializer = stateKeyType.createSerializer(executionConfig);
+			streamGraph.setOneInputStateKey(transformationId, stateKeySelector, keySerializer);
+		}
+
+		int parallelism = transformation.getParallelism() != ExecutionConfig.PARALLELISM_DEFAULT
+			? transformation.getParallelism()
+			: executionConfig.getParallelism();
+		streamGraph.setParallelism(transformationId, parallelism);
+		streamGraph.setMaxParallelism(transformationId, transformation.getMaxParallelism());
+
+		final List<Transformation<?>> parentTransformations = transformation.getInputs();
+		checkState(
+			parentTransformations.size() == 1,
+			"Expected exactly one input transformation but found " + parentTransformations.size());
+
+    // 添加StreamEdge
+		for (Integer inputId: context.getStreamNodeIds(parentTransformations.get(0))) {
+			streamGraph.addEdge(inputId, transformationId, 0);
+		}
+
+		return Collections.singleton(transformationId);
+	}
+```
+
+通过transform构造出StreamNode，最后与上游的transform进行连接，构造出StreamNode。
+
+最后再来看下对逻辑转换（partition、union等）的处理，如下是`PartitionTransformationTranslator`中的源码，用来进行partion转换：
+
+```java
+	@Override
+	protected Collection<Integer> translateForStreamingInternal(
+			final PartitionTransformation<OUT> transformation,
+			final Context context) {
+    // 点击下面的函数
+		return translateInternal(transformation, context);
+	}
+
+	private Collection<Integer> translateInternal(
+			final PartitionTransformation<OUT> transformation,
+			final Context context) {
+		checkNotNull(transformation);
+		checkNotNull(context);
+
+		final StreamGraph streamGraph = context.getStreamGraph();
+
+		final List<Transformation<?>> parentTransformations = transformation.getInputs();
+		checkState(
+				parentTransformations.size() == 1,
+				"Expected exactly one input transformation but found " + parentTransformations.size());
+		final Transformation<?> input = parentTransformations.get(0);
+
+		List<Integer> resultIds = new ArrayList<>();
+
+		for (Integer inputId: context.getStreamNodeIds(input)) {
+      // 生成一个新的虚拟id
+			final int virtualId = Transformation.getNewNodeId();
+      // 添加一个虚拟分区节点，不会生成 StreamNode
+			streamGraph.addVirtualPartitionNode(
+					inputId,
+					virtualId,
+					transformation.getPartitioner(),
+					transformation.getShuffleMode());
+			resultIds.add(virtualId);
+		}
+		return resultIds;
+	}
+```
+
+对partition的转换没有生成具体的StreamNode和StreamEdge，而是添加一个虚节点。当partition的下游transform（如map）添加edge时（调用StreamGraph.addEdge），会把partition信息写入到edge中。如StreamGraph.addEdgeInternal所示：
+
+```java
+	public void addEdge(Integer upStreamVertexID, Integer downStreamVertexID, int typeNumber) {
+		addEdgeInternal(upStreamVertexID,
+				downStreamVertexID,
+				typeNumber,
+				null,
+				new ArrayList<String>(),
+				null,
+				null);
+
+	}
+
+	private void addEdgeInternal(Integer upStreamVertexID,
+			Integer downStreamVertexID,
+			int typeNumber,
+			StreamPartitioner<?> partitioner,
+			List<String> outputNames,
+			OutputTag outputTag,
+			ShuffleMode shuffleMode) {
+
+    // 判断一下上游节点是不是在虚拟侧输出节点中，如果在，递归调用来添加边，并传入侧输出的信息
+		if (virtualSideOutputNodes.containsKey(upStreamVertexID)) {
+      // 上游节点的ID
+			int virtualId = upStreamVertexID;
+			upStreamVertexID = virtualSideOutputNodes.get(virtualId).f0;
+			if (outputTag == null) {
+				outputTag = virtualSideOutputNodes.get(virtualId).f1;
+			}
+			addEdgeInternal(upStreamVertexID, downStreamVertexID, typeNumber, partitioner, null, outputTag, shuffleMode);
+      // 当上游是partition时，递归调用，并传入partitioner信息
+		} else if (virtualPartitionNodes.containsKey(upStreamVertexID)) {
+      // 上游节点的id
+			int virtualId = upStreamVertexID;
+			upStreamVertexID = virtualPartitionNodes.get(virtualId).f0;
+			if (partitioner == null) {
+				partitioner = virtualPartitionNodes.get(virtualId).f1;
+			}
+			shuffleMode = virtualPartitionNodes.get(virtualId).f2;
+			addEdgeInternal(upStreamVertexID, downStreamVertexID, typeNumber, partitioner, outputNames, outputTag, shuffleMode);
+		} else {
+      // 真正构建StreamEdge
+			StreamNode upstreamNode = getStreamNode(upStreamVertexID);
+			StreamNode downstreamNode = getStreamNode(downStreamVertexID);
+
+			// If no partitioner was specified and the parallelism of upstream and downstream
+			// operator matches use forward partitioning, use rebalance otherwise.
+      // 未指定partitioner的话，会为其选择 forward 或 rebalance 分区。
+			if (partitioner == null && upstreamNode.getParallelism() == downstreamNode.getParallelism()) {
+				partitioner = new ForwardPartitioner<Object>();
+			} else if (partitioner == null) {
+				partitioner = new RebalancePartitioner<Object>();
+			}
+
+      // 健康检查， forward 分区必须要上下游的并发度一致，防御式编程
+			if (partitioner instanceof ForwardPartitioner) {
+				if (upstreamNode.getParallelism() != downstreamNode.getParallelism()) {
+					throw new UnsupportedOperationException("Forward partitioning does not allow " +
+							"change of parallelism. Upstream operation: " + upstreamNode + " parallelism: " + upstreamNode.getParallelism() +
+							", downstream operation: " + downstreamNode + " parallelism: " + downstreamNode.getParallelism() +
+							" You must use another partitioning strategy, such as broadcast, rebalance, shuffle or global.");
+				}
+			}
+
+			if (shuffleMode == null) {
+				shuffleMode = ShuffleMode.UNDEFINED;
+			}
+
+      // 创建 StreamEdge
+			StreamEdge edge = new StreamEdge(upstreamNode, downstreamNode, typeNumber,
+				partitioner, outputTag, shuffleMode);
+
+      // 将该 StreamEdge 添加到上游的输出，下游的输入
+			getStreamNode(edge.getSourceId()).addOutEdge(edge);
+			getStreamNode(edge.getTargetId()).addInEdge(edge);
+		}
+	}
+```
+
+### 实例讲解
+
+如下程序，是一个从 Source 中按行切分成单词并过滤输出的简单流程序，其中包含了逻辑转换：随机分区shuffle。我们会分析该程序是如何生成StreamGraph的。
+
+```java
+DataStream<String> text = env.socketTextStream(hostName, port);
+text.flatMap(new LineSplitter()).shuffle().filter(new HelloFilter()).print();
+```
+
+首先会在env中生成一棵transformation树，用List<Transformation<?>>保存。其结构图如下：
+
+![](./image/7.png)
+
+其中符号*为input指针，指向上游的transformation，从而形成了一棵transformation树。然后，通过调用StreamGraphGenerator.generate(env, transformations)来生成StreamGraph。自底向上递归调用每一个transformation，也就是说处理顺序是Source->FlatMap->Shuffle->Filter->Sink。
+
+![](./image/8.png)
+
+如上图所示：
+
+1. 首先处理的Source，生成了Source的StreamNode。
+2. 然后处理的FlatMap，生成了FlatMap的StreamNode，并生成StreamEdge连接上游Source和FlatMap。由于上下游的并发度不一样（1:4），所以此处是Rebalance分区。
+3. 然后处理的Shuffle，由于是逻辑转换，并不会生成实际的节点。将partitioner信息暂存在virtuaPartitionNodes中。
+4. 在处理Filter时，生成了Filter的StreamNode。发现上游是shuffle，找到shuffle的上游FlatMap，创建StreamEdge与Filter相连。并把ShufflePartitioner的信息写到StreamEdge中。
+5. 最后处理Sink，创建Sink的StreamNode，并生成StreamEdge与上游Filter相连。由于上下游并发度一样（4:4），所以此处选择 Forward 分区。
+
+最后可以通过 UI可视化 来观察得到的 StreamGraph。
+
+![](./image/9.png)
+
+## 如何生成JobGraph
+
 ## 深入分析flink的网络栈
 
 参考链接：https://flink.apache.org/2019/06/05/flink-network-stack.html
