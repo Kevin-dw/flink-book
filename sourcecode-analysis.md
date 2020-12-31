@@ -822,16 +822,8 @@ ExecutionGraph 的生成是在 ExecutionGraphBuilder 的 buildGraph() 方法中�
 			throw new JobException("Could not create the ExecutionGraph.", e);
 		}
 
-		// set the basic properties
-
-		try {
-			executionGraph.setJsonPlan(JsonPlanGenerator.generatePlan(jobGraph));
-		}
-		catch (Throwable t) {
-			log.warn("Cannot create JSON plan for job", t);
-			// give the graph an empty plan
-			executionGraph.setJsonPlan("{}");
-		}
+    // 设置json plan
+    // ...
 
 		// initialize the vertices that have a master initialization hook
 		// file output formats create directories here, input formats create splits
@@ -875,6 +867,7 @@ ExecutionGraph 的生成是在 ExecutionGraphBuilder 的 buildGraph() 方法中�
 		}
 
 		// 有关检查点的操作，略去
+    // ...
 
 		return executionGraph;
 	}
@@ -892,6 +885,7 @@ ExecutionGraph 的生成是在 ExecutionGraphBuilder 的 buildGraph() 方法中�
 		final ArrayList<ExecutionJobVertex> newExecJobVertices = new ArrayList<>(topologiallySorted.size());
 		final long createTimestamp = System.currentTimeMillis();
 
+    // 遍历Job Vertex
 		for (JobVertex jobVertex : topologiallySorted) {
 
 			if (jobVertex.isInputVertex() && !jobVertex.isStoppable()) {
@@ -900,6 +894,7 @@ ExecutionGraph 的生成是在 ExecutionGraphBuilder 的 buildGraph() 方法中�
 
 			// create the execution job vertex and attach it to the graph
       // 实例化执行图节点
+      // 根据每一个job vertex，创建对应的ExecutionVertex
 			ExecutionJobVertex ejv = new ExecutionJobVertex(
 					this,
 					jobVertex,
@@ -910,6 +905,7 @@ ExecutionGraph 的生成是在 ExecutionGraphBuilder 的 buildGraph() 方法中�
 					createTimestamp);
 
       // 将执行图节点ejv与前驱节点相连
+      // 将创建的ExecutionJobVertex与前置的IntermediateResult连接起来
 			ejv.connectToPredecessors(this.intermediateResults);
 
 			ExecutionJobVertex previousTask = this.tasks.putIfAbsent(jobVertex.getID(), ejv);
@@ -949,20 +945,26 @@ ExecutionGraph 的生成是在 ExecutionGraphBuilder 的 buildGraph() 方法中�
 	public void connectToPredecessors(Map<IntermediateDataSetID, IntermediateResult> intermediateDataSets) throws JobException {
 
     // 获取JobVertex的输入边组成的列表
+    // 获取输入的JobEdge列表
 		List<JobEdge> inputs = jobVertex.getInputs();
 
+    // 遍历每条JobEdge
 		for (int num = 0; num < inputs.size(); num++) {
 			JobEdge edge = inputs.get(num);
 
 			// fetch the intermediate result via ID. if it does not exist, then it either has not been created, or the order
 			// in which this method is called for the job vertices is not a topological order
       // 通过ID获取中间结果。如果中间结果不存在，那么或者中间结果没有被创建。或者JobVertex没有进行拓扑排序。
+      // 获取当前JobEdge的输入所对应的IntermediateResult
 			IntermediateResult ires = intermediateDataSets.get(edge.getSourceId());
 			if (ires == null) {
 				throw new JobException("Cannot connect this job graph to the previous graph. No previous intermediate result found for ID "
 						+ edge.getSourceId());
 			}
       // 将中间结果添加到输入中。注意这里this.inputs和上面inputs的区别
+      // 将IntermediateResult加入到当前ExecutionJobVertex的输入中。
+      // 为IntermediateResult注册consumer
+      // consumerIndex跟IntermediateResult的出度相关
 			this.inputs.add(ires);
       // 为中间结果注册消费者，这样中间结果的消费者又多了一个（就是当前节点）
 			int consumerIndex = ires.registerConsumer();
@@ -970,11 +972,74 @@ ExecutionGraph 的生成是在 ExecutionGraphBuilder 的 buildGraph() 方法中�
       // 所以要把每个节点都和前面的中间结果相连。
 			for (int i = 0; i < parallelism; i++) {
 				ExecutionVertex ev = taskVertices[i];
+        // 将ExecutionVertex与IntermediateResult关联起来
 				ev.connectSource(num, ires, edge, consumerIndex);
 			}
 		}
 	}
 ```
+
+接下来看一下`connectSource`方法
+
+```java
+	public void connectSource(int inputNumber, IntermediateResult source, JobEdge edge, int consumerNumber) {
+    // 只有forward的方式的情况下，pattern才是POINTWISE的，否则均为ALL_TO_ALL
+		final DistributionPattern pattern = edge.getDistributionPattern();
+		final IntermediateResultPartition[] sourcePartitions = source.getPartitions();
+
+		ExecutionEdge[] edges;
+
+		switch (pattern) {
+			case POINTWISE:
+				edges = connectPointwise(sourcePartitions, inputNumber);
+				break;
+
+			case ALL_TO_ALL:
+				edges = connectAllToAll(sourcePartitions, inputNumber);
+				break;
+
+			default:
+				throw new RuntimeException("Unrecognized distribution pattern.");
+
+		}
+
+		inputEdges[inputNumber] = edges;
+
+		// add the consumers to the source
+		// for now (until the receiver initiated handshake is in place), we need to register the
+		// edges as the execution graph
+    // 之前已经为IntermediateResult添加了consumer，这里为IntermediateResultPartition添加consumer，即关联到ExecutionEdge上
+		for (ExecutionEdge ee : edges) {
+			ee.getSource().addConsumer(ee, consumerNumber);
+		}
+	}
+```
+
+`connectAllToAll`方法
+
+```java
+	private ExecutionEdge[] connectAllToAll(IntermediateResultPartition[] sourcePartitions, int inputNumber) {
+		ExecutionEdge[] edges = new ExecutionEdge[sourcePartitions.length];
+
+		for (int i = 0; i < sourcePartitions.length; i++) {
+			IntermediateResultPartition irp = sourcePartitions[i];
+			edges[i] = new ExecutionEdge(irp, this, inputNumber);
+		}
+
+		return edges;
+	}
+```
+
+看这个方法之前，需要知道，ExecutionVertex的inputEdges变量，是一个二维数据。它表示了这个ExecutionVertex上每一个input所包含的ExecutionEdge列表。
+
+即，如果ExecutionVertex有两个不同的输入：输入A和B。其中输入A的partition=1， 输入B的partition=8，那么这个二维数组inputEdges如下(为简短，以irp代替IntermediateResultPartition)
+
+```
+[ ExecutionEdge[ A.irp[0]] ]
+[ ExecutionEdge[ B.irp[0], B.irp[1], ..., B.irp[7] ]
+```
+
+所以上面的代码就很容易理解了。
 
 本章详细介绍了 JobGraph 如何转换为 ExecutionGraph 的过程。到这里，StreamGraph、 JobGraph 和 ExecutionGraph 的生成过程，已经详细讲述完了，后面将会逐步介绍 runtime 的其他内容。
 
@@ -983,6 +1048,620 @@ ExecutionGraph 的生成是在 ExecutionGraphBuilder 的 buildGraph() 方法中�
 * StreamGraph 是最原始的用户逻辑，是一个没有做任何优化的 DataFlow；
 * JobGraph 对 StreamGraph 做了一些优化，主要是将能够 Chain 在一起的算子 Chain 在一起，这一样可以减少网络IO的开销；
 * ExecutionGraph 则是作业运行用来调度的执行图，可以看作是并行化版本的 JobGraph，将 DAG 拆分到基本的调度单元。
+
+到这里为止，ExecutionJobGraph就创建完成了。接下来看下这个ExecutionGraph是如何转化成Task并开始执行的。
+
+## Task的调度和执行
+
+接下来我们以最简单的mini cluster为例讲解一下Task如何被调度和执行。
+
+简单略过client端job的提交和StreamGraph到JobGraph的翻译，以及上面ExecutionGraph的翻译。
+
+提交后的job的流通过程大致如下：
+
+```
+env.execute()
+```
+
+点击`execute`方法，跳转到
+
+```java
+	public JobExecutionResult execute() throws Exception {
+    // 点击execute，跳转到后面的方法
+		return execute(getJobName());
+	}
+
+	public JobExecutionResult execute(String jobName) throws Exception {
+		Preconditions.checkNotNull(jobName, "Streaming Job name should not be null.");
+    // 点击execute，继续跳转到后面的方法；getStreamGraph方法用来生成StreamGraph，前面已经讲过了
+		return execute(getStreamGraph(jobName));
+	}
+```
+
+这时候看`StreamExecutionEnvironment.java`文件的1836行
+
+```java
+// 点击executeAsync，跳转到后面的方法
+final JobClient jobClient = executeAsync(streamGraph);
+```
+
+跳转以后，注意第1940行代码
+
+```java
+// 点击execute方法，跳转
+.execute(streamGraph, configuration, userClassloader);
+```
+
+这样会跳转到`PipelineExecutor`接口
+
+```java
+public interface PipelineExecutor {
+	CompletableFuture<JobClient> execute(final Pipeline pipeline, final Configuration configuration, final ClassLoader userCodeClassloader) throws Exception;
+}
+```
+
+这个接口就是执行器的接口，有几个实现，这里我们选择`LocalExecuter`，本地执行器。因为我们分析的是`MiniCluster`的行为。所以我们要看`LocalExecutor.java`中的`execute`方法实现，主要看
+
+```java
+// ...
+// StreamGraph --> JobGraph；之前详细讲过了
+final JobGraph jobGraph = getJobGraph(pipeline, effectiveConfig); // 79行
+
+// 点击submitJob方法
+return PerJobMiniClusterFactory.createWithFactory(effectiveConfig, miniClusterFactory).submitJob(jobGraph, userCodeClassloader); // 81行
+```
+
+`submit`方法中，重点看以下代码
+
+```java
+miniCluster.start(); // 74行，启动miniCluster集群
+
+return miniCluster         // 76行
+			.submitJob(jobGraph) // 77行
+```
+
+上面的代码分成了两步走
+
+1. 第一步，启动miniCluster集群
+2. 第二步，提交作业图
+
+### miniCluster的启动
+
+```java
+// 点击start
+miniCluster.start();
+```
+
+我们看一下`start`方法的代码
+
+```java
+	public void start() throws Exception {
+		synchronized (lock) {
+			checkState(!running, "MiniCluster is already running");
+
+			LOG.info("Starting Flink Mini Cluster");
+			LOG.debug("Using configuration {}", miniClusterConfiguration);
+
+			final Configuration configuration = miniClusterConfiguration.getConfiguration();
+			final boolean useSingleRpcService = miniClusterConfiguration.getRpcServiceSharing() == RpcServiceSharing.SHARED;
+
+			try {
+				initializeIOFormatClasses(configuration);
+
+				LOG.info("Starting Metrics Registry");
+				metricRegistry = createMetricRegistry(configuration);
+
+				// bring up all the RPC services
+				LOG.info("Starting RPC Service(s)");
+
+				final RpcServiceFactory dispatcherResourceManagerComponentRpcServiceFactory;
+				final RpcService metricQueryServiceRpcService;
+
+				if (useSingleRpcService) {
+					// we always need the 'commonRpcService' for auxiliary calls
+          // 只使用一个RpcService，需要创建一个本地的Rpc服务，MiniCluster就是只使用一个Rpc服务
+					commonRpcService = createLocalRpcService(configuration);
+					final CommonRpcServiceFactory commonRpcServiceFactory = new CommonRpcServiceFactory(commonRpcService);
+					taskManagerRpcServiceFactory = commonRpcServiceFactory;
+					dispatcherResourceManagerComponentRpcServiceFactory = commonRpcServiceFactory;
+					metricQueryServiceRpcService = MetricUtils.startLocalMetricsRpcService(configuration);
+				} else {
+          // 其他情况，每一个组件启动一个Rpc服务。
+					// start a new service per component, possibly with custom bind addresses
+					final String jobManagerExternalAddress = miniClusterConfiguration.getJobManagerExternalAddress();
+					final String taskManagerExternalAddress = miniClusterConfiguration.getTaskManagerExternalAddress();
+					final String jobManagerExternalPortRange = miniClusterConfiguration.getJobManagerExternalPortRange();
+					final String taskManagerExternalPortRange = miniClusterConfiguration.getTaskManagerExternalPortRange();
+					final String jobManagerBindAddress = miniClusterConfiguration.getJobManagerBindAddress();
+					final String taskManagerBindAddress = miniClusterConfiguration.getTaskManagerBindAddress();
+
+					dispatcherResourceManagerComponentRpcServiceFactory =
+						new DedicatedRpcServiceFactory(
+							configuration,
+							jobManagerExternalAddress,
+							jobManagerExternalPortRange,
+							jobManagerBindAddress);
+					taskManagerRpcServiceFactory =
+						new DedicatedRpcServiceFactory(
+							configuration,
+							taskManagerExternalAddress,
+							taskManagerExternalPortRange,
+							taskManagerBindAddress);
+
+					// we always need the 'commonRpcService' for auxiliary calls
+					// bind to the JobManager address with port 0
+					commonRpcService = createRemoteRpcService(configuration, jobManagerBindAddress, 0);
+					metricQueryServiceRpcService = MetricUtils.startRemoteMetricsRpcService(
+						configuration,
+						commonRpcService.getAddress());
+				}
+
+        // 启动统计集群的一些指标数据的服务
+				metricRegistry.startQueryService(metricQueryServiceRpcService, null);
+
+				processMetricGroup = MetricUtils.instantiateProcessMetricGroup(
+					metricRegistry,
+					RpcUtils.getHostname(commonRpcService),
+					ConfigurationUtils.getSystemResourceMetricsProbingInterval(configuration));
+
+				ioExecutor = Executors.newFixedThreadPool(
+					ClusterEntrypointUtils.getPoolSize(configuration),
+					new ExecutorThreadFactory("mini-cluster-io"));
+        // 创建高可用服务
+				haServices = createHighAvailabilityServices(configuration, ioExecutor);
+        // 启动Blob Server，Blob Server用来储存用户上传的JAR包
+				blobServer = new BlobServer(configuration, haServices.createBlobStore());
+				blobServer.start();
+
+				heartbeatServices = HeartbeatServices.fromConfiguration(configuration);
+
+				blobCacheService = new BlobCacheService(
+					configuration, haServices.createBlobStore(), new InetSocketAddress(InetAddress.getLocalHost(), blobServer.getPort())
+				);
+
+        // 启动任务管理器
+				startTaskManagers();
+
+				MetricQueryServiceRetriever metricQueryServiceRetriever = new RpcMetricQueryServiceRetriever(metricRegistry.getMetricQueryServiceRpcService());
+
+				setupDispatcherResourceManagerComponents(configuration, dispatcherResourceManagerComponentRpcServiceFactory, metricQueryServiceRetriever);
+
+				resourceManagerLeaderRetriever = haServices.getResourceManagerLeaderRetriever();
+				dispatcherLeaderRetriever = haServices.getDispatcherLeaderRetriever();
+				clusterRestEndpointLeaderRetrievalService = haServices.getClusterRestEndpointLeaderRetriever();
+
+				dispatcherGatewayRetriever = new RpcGatewayRetriever<>(
+					commonRpcService,
+					DispatcherGateway.class,
+					DispatcherId::fromUuid,
+					new ExponentialBackoffRetryStrategy(21, Duration.ofMillis(5L), Duration.ofMillis(20L)));
+				resourceManagerGatewayRetriever = new RpcGatewayRetriever<>(
+					commonRpcService,
+					ResourceManagerGateway.class,
+					ResourceManagerId::fromUuid,
+					new ExponentialBackoffRetryStrategy(21, Duration.ofMillis(5L), Duration.ofMillis(20L)));
+				webMonitorLeaderRetriever = new LeaderRetriever();
+
+				resourceManagerLeaderRetriever.start(resourceManagerGatewayRetriever);
+				dispatcherLeaderRetriever.start(dispatcherGatewayRetriever);
+				clusterRestEndpointLeaderRetrievalService.start(webMonitorLeaderRetriever);
+			}
+			catch (Exception e) {
+				// cleanup everything
+				try {
+					close();
+				} catch (Exception ee) {
+					e.addSuppressed(ee);
+				}
+				throw e;
+			}
+
+			// create a new termination future
+			terminationFuture = new CompletableFuture<>();
+
+			// now officially mark this as running
+			running = true;
+
+			LOG.info("Flink Mini Cluster started successfully");
+		}
+	}
+```
+
+### 提交JobGraph的流程分析
+
+主要分析这句代码
+
+```java
+return miniCluster
+      // 点击进入
+			.submitJob(jobGraph)
+```
+
+跳转过去以后，看第689行代码
+
+```java
+// 点击submitJob方法
+(Void ack, DispatcherGateway dispatcherGateway) -> dispatcherGateway.submitJob(jobGraph, rpcTimeout))
+```
+
+我们来看`submitJob`方法在`Dispatcher.java`中的实现，看第306行
+
+```java
+return internalSubmitJob(jobGraph);
+```
+
+我们来看`internalSubmitJob`方法中的这一行
+
+```java
+final CompletableFuture<Acknowledge> persistAndRunFuture = waitForTerminatingJob(jobGraph.getJobID(), jobGraph,
+  this::persistAndRunJob)
+  .thenApply(ignored -> Acknowledge.get());
+```
+
+点击`persistAndRunJob`方法，可以看到代码是：
+
+```java
+	private void persistAndRunJob(JobGraph jobGraph) throws Exception {
+		jobGraphWriter.putJobGraph(jobGraph);
+		runJob(jobGraph, ExecutionType.SUBMISSION);
+	}
+```
+
+继续点击`runJob`方法，重点来看这行代码
+
+```java
+CompletableFuture<JobManagerRunner> jobManagerRunnerFuture = createJobManagerRunner(jobGraph, initializationTimestamp);
+```
+
+这里`createJobManagerRunner`创建了一个`JobManagerRunner`对象。同时还运行了这个对象。代码是`runner.start()`。
+
+点击进入`start()`方法以后，`start`方法里面有一行代码：
+
+```java
+leaderElectionService.start(this);
+```
+
+这里启动了一个`leader`选举服务。这是为了高可用而抽象出来的服务。例如，如果使用ZooKeeper进行高可用时，涉及到`leader`选举的问题。
+
+由于我们启动的是一个MiniCluster，所以我们这里启动的`JobManager`本身就是leader，只是还得走一个过场。我们接着看。
+
+点击`start`方法。我们来看`EmbeddedLeaderService.java`中的`start`方法的代码
+
+```java
+@Override
+public void start(LeaderContender contender) throws Exception {
+  checkNotNull(contender);
+  // 将当前启动的JobManager添加到竞争者行列，其实就一个。
+  addContender(this, contender);
+}
+```
+
+点击`addContender`方法，可以看到这个方法中有一行代码很关键：
+
+```java
+// 更新领导者
+updateLeader().whenComplete((aVoid, throwable) -> {
+  if (throwable != null) {
+    fatalError(throwable);
+  }
+});
+```
+
+点击`updateLeader`进入代码看一下，主要看下面这些代码
+
+```java
+// 生成当前领导者任期的UUID
+final UUID leaderSessionId = UUID.randomUUID();
+// 从迭代器中取出第一个领导者的候选人
+EmbeddedLeaderElectionService leaderService = allLeaderContenders.iterator().next();
+
+// 设置当前领导者任期的ID
+currentLeaderSessionId = leaderSessionId;
+// 设置当前领导者
+currentLeaderProposed = leaderService;
+currentLeaderProposed.isLeader = true;
+
+LOG.info("Proposing leadership to contender {}", leaderService.contender.getDescription());
+// 执行GrantLeadershipCall方法
+return execute(new GrantLeadershipCall(leaderService.contender, leaderSessionId, LOG));
+```
+
+这里要注意由于`GrantLeadershipCall`实现了`Runnable`接口，所以当我们调用`execute`方法时，调用的是`GrantLeadershipCall`里面的`run()`方法，见下面的代码：
+
+```java
+@Override
+public void run() {
+  try {
+    // 点击grantLeadership方法
+    contender.grantLeadership(leaderSessionId);
+  }
+  catch (Throwable t) {
+    logger.warn("Error granting leadership to contender", t);
+    contender.handleError(t instanceof Exception ? (Exception) t : new Exception(t));
+  }
+}
+```
+
+我们看一下`JobManagerRunnerImpl.java`中`grantLeadership`方法的实现，尤其是下面这行代码
+
+```java
+// 校验作业的调度状态然后启动作业管理器
+return verifyJobSchedulingStatusAndStartJobManager(leaderSessionID);
+```
+
+看一下`verifyJobSchedulingStatusAndStartJobManager`方法的实现，重点是这一行代码：
+
+```java
+return startJobMaster(leaderSessionId);
+```
+
+这里启动了一个`Job Master`。点击进入`startJobMaster`方法体中，看下面这一行代码
+
+```java
+startFuture = jobMasterService.start(new JobMasterId(leaderSessionId));
+```
+
+然后点击进入`start`方法体中
+
+```java
+public CompletableFuture<Acknowledge> start(final JobMasterId newJobMasterId) throws Exception {
+  // make sure we receive RPC and async calls
+  // 再启动以下rpc服务，确保我们能接到rpc请求
+  start();
+
+  return callAsyncWithoutFencing(() -> startJobExecution(newJobMasterId), RpcUtils.INF_TIMEOUT);
+}
+```
+
+`startJobExecution`方法就是开始执行Job的方法，点进去看一下
+
+```java
+	private Acknowledge startJobExecution(JobMasterId newJobMasterId) throws Exception {
+
+		validateRunsInMainThread();
+
+		checkNotNull(newJobMasterId, "The new JobMasterId must not be null.");
+
+		if (Objects.equals(getFencingToken(), newJobMasterId)) {
+			log.info("Already started the job execution with JobMasterId {}.", newJobMasterId);
+
+			return Acknowledge.get();
+		}
+    // 将job master id设置为fencing token，作为分布式锁
+		setNewFencingToken(newJobMasterId);
+    // 开启Job Master服务
+		startJobMasterServices();
+
+		log.info("Starting execution of job {} ({}) under job master id {}.", jobGraph.getName(), jobGraph.getJobID(), newJobMasterId);
+    // 启动调度服务
+		resetAndStartScheduler();
+
+		return Acknowledge.get();
+	}
+```
+
+我们看一下`startJobMasterServices`的代码
+
+```java
+	private void startJobMasterServices() throws Exception {
+    // 开启心跳服务
+		startHeartbeatServices();
+
+		// start the slot pool make sure the slot pool now accepts messages for this leader
+    // 启动任务槽池，确保任务槽池可以接收来自当前JobMaster的请求（申请资源）
+    // start方法会定时去寻找空闲的任务槽，然后释放任务槽
+		slotPool.start(getFencingToken(), getAddress(), getMainThreadExecutor());
+
+		//TODO: Remove once the ZooKeeperLeaderRetrieval returns the stored address upon start
+		// try to reconnect to previously known leader
+    // 连接资源管理器
+		reconnectToResourceManager(new FlinkException("Starting JobMaster component."));
+
+		// job is ready to go, try to establish connection with resource manager
+		//   - activate leader retrieval for the resource manager
+		//   - on notification of the leader, the connection will be established and
+		//     the slot pool will start requesting slots
+    // 当作业准备好时，启动一个资源管理器的领导者选举服务，领导者选举好以后，连接正式建立
+    // 任务槽池开始请求任务槽
+		resourceManagerLeaderRetriever.start(new ResourceManagerLeaderListener());
+	}
+```
+
+资源管理器和任务槽池准备好以后，我们就可以开始调度了。看一下`resetAndStartScheduler`方法中的下面一行代码
+
+```java
+FutureUtils.assertNoException(schedulerAssignedFuture.thenRun(this::startScheduling));
+```
+
+有一个方法`startScheduling`，这个方法就是用来开始调度任务的。点击进去看一下，主要看下面这一行代码
+
+```java
+schedulerNG.startScheduling();
+```
+
+继续点击`startScheduling`方法，可以看到下面的代码
+
+```java
+	@Override
+	public final void startScheduling() {
+		mainThreadExecutor.assertRunningInMainThread();
+		registerJobMetrics();
+		startAllOperatorCoordinators();
+		startSchedulingInternal(); // 开始调度，点击
+	}
+```
+
+来到了下面的代码
+
+```java
+	@Override
+	protected void startSchedulingInternal() {
+		log.info("Starting scheduling with scheduling strategy [{}]", schedulingStrategy.getClass().getName());
+		prepareExecutionGraphForNgScheduling(); // 为调度器准备好执行图
+		schedulingStrategy.startScheduling();   // 开始调度
+	}
+```
+
+流式作业，使用的调度方式是`EagerSchedulingStractegy`这个类。看一下里面的`startScheduling`方法的实现
+
+```java
+	@Override
+	public void startScheduling() {
+    // 点击下面的方法，分配任务槽，然后部署任务
+		allocateSlotsAndDeploy(SchedulingStrategyUtils.getAllVertexIdsFromTopology(schedulingTopology));
+	}
+```
+
+来到了下面的代码
+
+```java
+	private void allocateSlotsAndDeploy(final Set<ExecutionVertexID> verticesToDeploy) {
+		final List<ExecutionVertexDeploymentOption> executionVertexDeploymentOptions =
+			SchedulingStrategyUtils.createExecutionVertexDeploymentOptionsInTopologicalOrder(
+				schedulingTopology,
+				verticesToDeploy,
+				id -> deploymentOption);
+    // 继续点击下面的方法
+		schedulerOperations.allocateSlotsAndDeploy(executionVertexDeploymentOptions);
+	}
+```
+
+来看一下`allocateSlotAndDeploy`方法体的最后一行代码
+
+```java
+// 这行代码将会部署所有的操作，也就是deploymentHandles
+// 点击进入方法
+waitForAllSlotsAndDeploy(deploymentHandles);
+```
+
+来到了
+
+```java
+	private void waitForAllSlotsAndDeploy(final List<DeploymentHandle> deploymentHandles) {
+		FutureUtils.assertNoException(
+			assignAllResources(deploymentHandles).handle(deployAll(deploymentHandles)));
+	}
+```
+
+`assignAllResources`方法用来分配资源，也就是任务槽。`deployAll`方法用来部署所有操作。我们看一下`deployAll`方法。
+
+```java
+	private BiFunction<Void, Throwable, Void> deployAll(final List<DeploymentHandle> deploymentHandles) {
+		return (ignored, throwable) -> {
+			propagateIfNonNull(throwable);
+			for (final DeploymentHandle deploymentHandle : deploymentHandles) {
+				final SlotExecutionVertexAssignment slotExecutionVertexAssignment = deploymentHandle.getSlotExecutionVertexAssignment();
+				final CompletableFuture<LogicalSlot> slotAssigned = slotExecutionVertexAssignment.getLogicalSlotFuture();
+				checkState(slotAssigned.isDone());
+
+				FutureUtils.assertNoException(
+          // 主要是这一行，点击deployOrHandleError方法
+					slotAssigned.handle(deployOrHandleError(deploymentHandle)));
+			}
+			return null;
+		};
+	}
+```
+
+进入`deployOrHandleError`方法，然后主要看下面这一行代码，将执行图的节点部署执行。
+
+```java
+deployTaskSafe(executionVertexId);
+```
+
+我们来看一下`deployTaskSafe`的代码
+
+```java
+	private void deployTaskSafe(final ExecutionVertexID executionVertexId) {
+		try {
+      // 通过执行图的节点ID获取执行图的节点
+			final ExecutionVertex executionVertex = getExecutionVertex(executionVertexId);
+      // deploy方法用来部署执行图节点
+			executionVertexOperations.deploy(executionVertex);
+		} catch (Throwable e) {
+			handleTaskDeploymentFailure(executionVertexId, e);
+		}
+	}
+```
+
+我们看一下`deploy`的代码
+
+```java
+@Override
+public void deploy(final ExecutionVertex executionVertex) throws JobException {
+  executionVertex.deploy();
+}
+
+public void deploy() throws JobException {
+  currentExecution.deploy();
+}
+
+public void deploy() throws JobException {
+  // 一堆状态机的跳转操作
+  // ...
+
+  CompletableFuture.supplyAsync(() -> taskManagerGateway.submitTask(deployment, rpcTimeout), executor)
+
+  // 一堆异常处理
+  // ...
+}
+```
+
+`submitTask`方法用来提交任务。点进去看一下。
+
+```java
+@Override
+public CompletableFuture<Acknowledge> submitTask(TaskDeploymentDescriptor tdd, Time timeout) {
+  return taskExecutorGateway.submitTask(tdd, jobMasterId, timeout);
+}
+```
+
+继续点击`submitTask`方法
+
+```java
+// ...
+
+// 实例化一个Task类
+Task task = new Task(
+  jobInformation,
+  taskInformation,
+  tdd.getExecutionAttemptId(),
+  tdd.getAllocationId(),
+  tdd.getSubtaskIndex(),
+  tdd.getAttemptNumber(),
+  tdd.getProducedPartitions(),
+  tdd.getInputGates(),
+  tdd.getTargetSlotNumber(),
+  memoryManager,
+  taskExecutorServices.getIOManager(),
+  taskExecutorServices.getShuffleEnvironment(),
+  taskExecutorServices.getKvStateService(),
+  taskExecutorServices.getBroadcastVariableManager(),
+  taskExecutorServices.getTaskEventDispatcher(),
+  externalResourceInfoProvider,
+  taskStateManager,
+  taskManagerActions,
+  inputSplitProvider,
+  checkpointResponder,
+  taskOperatorEventGateway,
+  aggregateManager,
+  classLoaderHandle,
+  fileCache,
+  taskManagerConfiguration,
+  taskMetricGroup,
+  resultPartitionConsumableNotifier,
+  partitionStateChecker,
+  getRpcService().getExecutor());
+
+// ...
+
+// 执行task任务
+task.startTaskThread();
+
+// ...
+```
+
+执行任务时，会调用`Task.java`中的`run()`方法，进一步查看源码，会发现调用了`doRun()`方法。
 
 ## 深入分析flink的网络栈
 
