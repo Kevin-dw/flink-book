@@ -1663,6 +1663,215 @@ task.startTaskThread();
 
 执行任务时，会调用`Task.java`中的`run()`方法，进一步查看源码，会发现调用了`doRun()`方法。
 
+接下来我们看一下第722行
+
+```java
+invokable.invoke();
+```
+
+点击进入`invoke()`方法。我们这里看一下`invoke()`方法在`StreamTask.java`中的实现。因为`map`之类的任务是`StreamTask`任务，所以我们用`map`算子来举例子。来看一下`invoke()`方法的实现：
+
+```java
+	@Override
+	public final void invoke() throws Exception {
+		try {
+			beforeInvoke(); // 运行任务之前的准备工作
+
+			// final check to exit early before starting to run
+			if (canceled) {
+				throw new CancelTaskException();
+			}
+
+			// let the task do its work
+            // 这一行很重要，点进去看看
+			runMailboxLoop(); // 运行任务
+
+			// if this left the run() method cleanly despite the fact that this was canceled,
+			// make sure the "clean shutdown" is not attempted
+			if (canceled) {
+				throw new CancelTaskException();
+			}
+
+			afterInvoke(); // 运行完任务以后的清理工作
+		}
+		catch (Throwable invokeException) {
+			failing = !canceled;
+			try {
+				cleanUpInvoke();
+			}
+			// TODO: investigate why Throwable instead of Exception is used here.
+			catch (Throwable cleanUpException) {
+				Throwable throwable = ExceptionUtils.firstOrSuppressed(cleanUpException, invokeException);
+				ExceptionUtils.rethrowException(throwable);
+			}
+			ExceptionUtils.rethrowException(invokeException);
+		}
+		cleanUpInvoke();
+	}
+```
+
+`runMailboxLoop()`方法是真正执行任务的方法。我们看一下它的实现
+
+```java
+public void runMailboxLoop() throws Exception {
+    mailboxProcessor.runMailboxLoop();
+}
+
+public void runMailboxLoop() throws Exception {
+
+    final TaskMailbox localMailbox = mailbox;
+
+    Preconditions.checkState(
+        localMailbox.isMailboxThread(),
+        "Method must be executed by declared mailbox thread!");
+
+    assert localMailbox.getState() == TaskMailbox.State.OPEN : "Mailbox must be opened!";
+
+    final MailboxController defaultActionContext = new MailboxController(this);
+
+    // 邮箱里只要有邮件，就进行处理。
+    // 邮箱里的邮件就是类似于map之类的子任务。
+    while (isMailboxLoopRunning()) {
+        // The blocking `processMail` call will not return until default action is available.
+        processMail(localMailbox, false);
+        if (isMailboxLoopRunning()) {
+            mailboxDefaultAction.runDefaultAction(defaultActionContext); // lock is acquired inside default action as needed
+        }
+    }
+}
+```
+
+这里面有一个方法`runDefaultAction`，用来执行默认操作，什么默认操作呢？
+
+我们现在回到`StreamTask.java`的第292行代码。如下
+
+```java
+this.mailboxProcessor = new MailboxProcessor(this::processInput, mailbox, actionExecutor);
+```
+
+也就是说在实例化`StreamTask`类时，实例化了一个`MailboxProcessor`类。这个类的第一个参数就是默认操作。
+
+也就是说默认操作是`this::processInput`方法。我们来看一下这个方法。这个方法用来处理子任务的输入。
+
+```java
+protected void processInput(MailboxDefaultAction.Controller controller) throws Exception {
+    // 点击processInput
+    InputStatus status = inputProcessor.processInput();
+    if (status == InputStatus.MORE_AVAILABLE && recordWriter.isAvailable()) {
+        return;
+    }
+    if (status == InputStatus.END_OF_INPUT) {
+        controller.allActionsCompleted();
+        return;
+    }
+    CompletableFuture<?> jointFuture = getInputOutputJointFuture(status);
+    MailboxDefaultAction.Suspension suspendedDefaultAction = controller.suspendDefaultAction();
+    assertNoException(jointFuture.thenRun(suspendedDefaultAction::resume));
+}
+```
+
+我们来看一下`StreamOneInputProcessor.java`中`processInput`的实现
+
+```java
+@Override
+public InputStatus processInput() throws Exception {
+    InputStatus status = input.emitNext(output);
+
+    if (status == InputStatus.END_OF_INPUT) {
+        endOfInputAware.endInput(input.getInputIndex() + 1);
+    }
+
+    return status;
+}
+```
+
+我们看一下任务是怎样处理输入的，重点是这个方法：`emitNext`。
+
+我们点击进去看一下`StreamTaskNetworkInput`中`emitNext`方法的实现
+
+```java
+	@Override
+	public InputStatus emitNext(DataOutput<T> output) throws Exception {
+
+		while (true) {
+			// get the stream element from the deserializer
+			if (currentRecordDeserializer != null) {
+				DeserializationResult result = currentRecordDeserializer.getNextRecord(deserializationDelegate);
+				if (result.isBufferConsumed()) {
+					currentRecordDeserializer.getCurrentBuffer().recycleBuffer();
+					currentRecordDeserializer = null;
+				}
+
+				if (result.isFullRecord()) {
+                    // 点击processElement
+					processElement(deserializationDelegate.getInstance(), output);
+					return InputStatus.MORE_AVAILABLE;
+				}
+			}
+
+			Optional<BufferOrEvent> bufferOrEvent = checkpointedInputGate.pollNext();
+			if (bufferOrEvent.isPresent()) {
+				// return to the mailbox after receiving a checkpoint barrier to avoid processing of
+				// data after the barrier before checkpoint is performed for unaligned checkpoint mode
+				if (bufferOrEvent.get().isBuffer()) {
+					processBuffer(bufferOrEvent.get());
+				} else {
+					processEvent(bufferOrEvent.get());
+					return InputStatus.MORE_AVAILABLE;
+				}
+			} else {
+				if (checkpointedInputGate.isFinished()) {
+					checkState(checkpointedInputGate.getAvailableFuture().isDone(), "Finished BarrierHandler should be available");
+					return InputStatus.END_OF_INPUT;
+				}
+				return InputStatus.NOTHING_AVAILABLE;
+			}
+		}
+	}
+```
+
+我们看一下`processElement`这个方法是如何处理输入元素的
+
+```java
+private void processElement(StreamElement recordOrMark, DataOutput<T> output) throws Exception {
+    if (recordOrMark.isRecord()){
+        // 点击emitRecord方法
+        output.emitRecord(recordOrMark.asRecord());
+    } else if (recordOrMark.isWatermark()) {
+        statusWatermarkValve.inputWatermark(recordOrMark.asWatermark(), lastChannel, output);
+    } else if (recordOrMark.isLatencyMarker()) {
+        output.emitLatencyMarker(recordOrMark.asLatencyMarker());
+    } else if (recordOrMark.isStreamStatus()) {
+        statusWatermarkValve.inputStreamStatus(recordOrMark.asStreamStatus(), lastChannel, output);
+    } else {
+        throw new UnsupportedOperationException("Unknown type of StreamElement");
+    }
+}
+```
+
+由于我们研究的是`map`任务，所以我们需要点击一下`emitRecord`方法。代码如下，在文件`OneInputStreamTask.java`中。
+
+```java
+@Override
+public void emitRecord(StreamRecord<IN> record) throws Exception {
+    numRecordsIn.inc();
+    operator.setKeyContextElement1(record);
+    // 点击processElement
+    operator.processElement(record);
+}
+```
+
+`map`对应的`operator`是`StreamMap.java`，我们看一下里面的`processElement`方法：
+
+```java
+@Override
+public void processElement(StreamRecord<IN> element) throws Exception {
+    output.collect(element.replace(userFunction.map(element.getValue())));
+}
+```
+
+这里的`userFunction`就是我们定义的`MapFunction`，所以`userFunction.map`就调用了我们`override`的`map`方法。调用完之后就将结果向下游输出了。
+
 ## 深入分析flink的网络栈
 
 参考链接：https://flink.apache.org/2019/06/05/flink-network-stack.html
